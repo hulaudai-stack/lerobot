@@ -47,6 +47,7 @@ POSTURE_SETS = {
 
 DEFAULTS = {
     "step": 8,
+    "move_step": 8,
     "torque_limits": [150, 300, 500],
     "stall_error": 200,
     "stall_cycles": 5,
@@ -54,8 +55,11 @@ DEFAULTS = {
     "postures": "default",
 }
 SPACE = {
-    "step": [8, 12, 16, 24],
-    "torque_limits": [[150, 300, 500], [200, 500], [250, 500], [150, 500]],
+    # Faster moves fail: a hand that starts near the table swings into it and wedges (see README).
+    "step": [8],
+    "move_step": [8],
+    # A first push above 15% presses a hand near the table hard enough to wedge it.
+    "torque_limits": [[150, 300, 500], [150, 500], [150, 250, 500], [150, 350]],
     "stall_error": [150, 200, 300],
     "stall_cycles": [3, 4, 5],
     "survey_ticks": [100, 150],
@@ -156,6 +160,7 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
     def tuned(*args, **kwargs):
         kwargs.update(
             step=params["step"],
+            move_step=params.get("move_step", params["step"]),
             stall_error=params["stall_error"],
             stall_cycles=params["stall_cycles"],
             survey_ticks=params["survey_ticks"],
@@ -271,12 +276,12 @@ class Study:
             "",
             "Pass = every stop found within 3°. Time = simulated seconds per calibration, mean.",
             "",
-            "| Settings | Passed | Mean time (s) | step | torque ladder | stall lead | stall cycles | survey | postures |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| Settings | Passed | Mean time (s) | push step | move step | torque ladder | stall lead | stall cycles | survey | postures |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for _, mean_s, name, p, passed, total in rows:
             lines.append(
-                f"| {name} | {passed}/{total} | {mean_s:.0f} | {p['step']} | {p['torque_limits']} | {p['stall_error']} "
+                f"| {name} | {passed}/{total} | {mean_s:.0f} | {p['step']} | {p.get('move_step', p['step'])} | {p['torque_limits']} | {p['stall_error']} "
                 f"| {p['stall_cycles']} | {p['survey_ticks']} | {p['postures']} |"
             )
         (self.out / "leaderboard.md").write_text("\n".join(lines) + "\n")

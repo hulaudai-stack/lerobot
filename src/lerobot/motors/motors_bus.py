@@ -1310,6 +1310,7 @@ class SerialMotorsBus(MotorsBusBase):
         gravity_threshold: int = 4,
         margin: int = 20,
         step: int = 8,
+        move_step: int | None = None,
         stall_error: int = 200,
         stall_cycles: int = 5,
         guard: int = 150,
@@ -1377,6 +1378,11 @@ class SerialMotorsBus(MotorsBusBase):
                 Ticks of average sag below which the survey finds no pull.
             margin (`int`, *optional*, defaults to `20`):
                 Ticks between each stop and the end of the range recorded.
+            move_step (`int`, *optional*):
+                Ticks per period of the moves through space the arm has swept already, back to
+                where the joints started or into a posture; `None` moves as fast as `step`. The
+                pushes towards an unknown stop keep to `step`: faster, a joint meets what stops it
+                harder, and can wedge a link against it.
             step, stall_error, stall_cycles, guard, period_s:
                 Passed to [`~SerialMotorsBus.find_hard_stop`]. `stall_error` is how far the goal may
                 lead a joint: a position servo pushes in proportion to it, so it must be large
@@ -1492,13 +1498,15 @@ class SerialMotorsBus(MotorsBusBase):
                     make_room(motor, direction, end.position - shifts[motor])
             raise RuntimeError(f"Motor '{motor}' found no hard stop within a turn.")
 
+        free_step = move_step or step
+
         def move(motor: str, position: int) -> None:
             current = int(self.read("Present_Position", motor, normalize=False)) - shifts[motor]
             follow_state["motion"] = (position > current) - (position < current)
             self.move_to_position(
                 motor,
                 position + shifts[motor],
-                step=step,
+                step=free_step,
                 period_s=period_s,
                 tolerance=return_tolerance,
                 on_step=on_step(motor),
@@ -1506,7 +1514,7 @@ class SerialMotorsBus(MotorsBusBase):
 
         def move_raw(motor: str, target: int, settle: bool = False) -> int:
             return self.move_to_position(
-                motor, target, step=step, period_s=period_s, tolerance=return_tolerance, settle=settle
+                motor, target, step=free_step, period_s=period_s, tolerance=return_tolerance, settle=settle
             )
 
         try:
@@ -1538,7 +1546,9 @@ class SerialMotorsBus(MotorsBusBase):
                     ]
                     if not unknown:
                         continue
-                    placed = {o: place for o, place in posture.items() if not isinstance(place, (Follow, Raised))}
+                    placed = {
+                        o: place for o, place in posture.items() if not isinstance(place, (Follow, Raised))
+                    }
                     for other, fraction in placed.items():
                         low, high = range_mins[other], range_maxes[other]
                         move(other, round(low + fraction * (high - low)) - shifts[other])
