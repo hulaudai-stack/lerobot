@@ -1538,10 +1538,10 @@ class SerialMotorsBus(MotorsBusBase):
                     ]
                     if not unknown:
                         continue
-                    placed = [o for o, place in posture.items() if not isinstance(place, (Follow, Raised))]
-                    for other in placed:
+                    placed = {o: place for o, place in posture.items() if not isinstance(place, (Follow, Raised))}
+                    for other, fraction in placed.items():
                         low, high = range_mins[other], range_maxes[other]
-                        move(other, round(low + posture[other] * (high - low)) - shifts[other])
+                        move(other, round(low + fraction * (high - low)) - shifts[other])
                     for other in unknown:
                         move(other, (range_mins[other] + range_maxes[other]) // 2 - shifts[other])
                         gravity[other] = self._survey_gravity(
