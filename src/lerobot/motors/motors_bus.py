@@ -43,6 +43,23 @@ else:
 _TRANSPORT_ERRORS = (RuntimeError, OSError)
 
 
+@dataclass(frozen=True)
+class Follow:
+    """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor that
+    follows the one searched: it turns `ratio` ticks for each tick the goal of the searched one
+    turns from where it started, within its own range. A ratio of 1 or -1 makes a joint cancel the turn of
+    the one searched, e.g. an elbow keeping the forearm level while the shoulder tips."""
+
+    ratio: float
+
+
+@dataclass(frozen=True)
+class Raised:
+    """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor placed
+    at the end of its range that gravity pulls away from, as its survey found: a wrist bent
+    upward, say. A posture with a motor whose survey found no pull is tried at both ends."""
+
+
 # Where an automatic calibration parks a joint's low stop, beyond its margin, before seeking the
 # high stop: near the bottom of the encoder, so the high stop fits whatever pose the joint started in.
 _LOW_STOP_PARKING = 100
@@ -1050,13 +1067,17 @@ class SerialMotorsBus(MotorsBusBase):
         tolerance: int = 20,
         settle_cycles: int = 10,
         still_ticks: int = 3,
+        settle: bool = False,
+        on_step: Callable[[int], None] | None = None,
     ) -> int:
         """Ramp the raw goal of a torque-enabled `motor` to `target`, `step` ticks every
         `period_s`, so the joint never jumps, then wait until it is within `tolerance` of it.
 
         A joint holding a load settles short of its goal, as a position-controlled servo sags
         under gravity: once it has moved no more than `still_ticks` over `settle_cycles`
-        periods, it has gone as far as it will.
+        periods, it has gone as far as it will. With `settle`, the joint is always left to settle,
+        and the position returned is where it came to rest. `on_step`, if given, is called with
+        each raw goal of the ramp, e.g. to move other joints along with it.
 
         Returns:
             `int`: The raw position reached.
@@ -1069,16 +1090,20 @@ class SerialMotorsBus(MotorsBusBase):
         while goal != target:
             goal += max(-step, min(step, target - goal))
             self.write("Goal_Position", motor, goal, normalize=False)
+            if on_step is not None:
+                on_step(goal)
             time.sleep(period_s)
         recent: deque[int] = deque(maxlen=settle_cycles + 1)
         for _ in range(20 * settle_cycles):
             position = int(self.read("Present_Position", motor, normalize=False))
             recent.append(position)
-            if abs(position - target) <= tolerance:
+            if not settle and abs(position - target) <= tolerance:
                 return position
             if len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks:
                 break
             time.sleep(period_s)
+        if abs(position - target) <= tolerance:
+            return position
         raise RuntimeError(
             f"Motor '{motor}' did not reach position {target}; it stopped at {position}, "
             f"{abs(position - target)} ticks away. Is something in its way?"
@@ -1094,6 +1119,7 @@ class SerialMotorsBus(MotorsBusBase):
         stall_cycles: int = 5,
         still_ticks: int = 3,
         period_s: float = 0.02,
+        on_step: Callable[[int], None] | None = None,
     ) -> int:
         """Drive a torque-enabled `motor` slowly in `direction` (+1 or -1) until it stalls.
 
@@ -1103,7 +1129,9 @@ class SerialMotorsBus(MotorsBusBase):
         the last `stall_cycles` periods, so a joint that is slow but still moving, as one lifting
         a load, is not mistaken for a stalled one. The goal is then set to the position reached,
         so the motor stops pushing. Limit the motor's torque beforehand: a stall is the joint
-        pressing on its stop, or on whatever holds it back at that torque.
+        pressing on its stop, or on whatever holds it back at that torque. `on_step`, if given,
+        is called with each new raw goal: as the goal only advances, and holds once the joint
+        is held back, joints moved along with it never push it back and forth.
 
         Returns:
             `int`: The raw position where the joint stalled.
@@ -1137,6 +1165,8 @@ class SerialMotorsBus(MotorsBusBase):
                         position,
                     )
                 self.write("Goal_Position", motor, goal, normalize=False)
+                if on_step is not None:
+                    on_step(goal)
             time.sleep(period_s)
         self.write("Goal_Position", motor, position, normalize=False)
         raise RuntimeError(f"Motor '{motor}' neither stalled nor reached the end of its encoder.")
@@ -1208,6 +1238,53 @@ class SerialMotorsBus(MotorsBusBase):
             self.enable_torque(motor)
         return applied
 
+    def _survey_gravity(self, motor: str, ticks: int, threshold: int, move: Callable[..., int]) -> int:
+        """Turn a held `motor` `ticks` each way from where it is and back, letting it settle each
+        time, and tell where gravity pulls it: +1 towards higher readings, -1 towards lower ones,
+        0 if it sagged less than `threshold` ticks on average. Friction holds a joint short of
+        its goal on either side and cancels out; gravity holds it short the same way on both.
+        A side the joint cannot turn to is left out. `move(motor, raw_target, settle=...)`
+        moves it and returns where it came to rest."""
+        if ticks <= 0:
+            return 0
+        start = int(self.read("Present_Position", motor, normalize=False))
+        sags = []
+        for direction in (1, -1):
+            target = start + direction * ticks
+            try:
+                sags.append(move(motor, target, settle=True) - target)
+            except RuntimeError:
+                logger.info(
+                    f"{motor}: cannot turn {ticks} ticks towards {'higher' if direction > 0 else 'lower'} readings"
+                )
+            move(motor, start)
+        pull = sum(sags) / len(sags) if sags else 0
+        pulled = 0 if abs(pull) < threshold else (1 if pull > 0 else -1)
+        logger.info(
+            f"{motor}: survey sag {pull:+.1f} ticks, gravity pulls {('towards lower readings', 'nowhere clear', 'towards higher readings')[pulled + 1]}"
+        )
+        return pulled
+
+    @staticmethod
+    def _resolve_raised(
+        postures: Sequence[Mapping[str, float | Follow | Raised]], gravity: Mapping[str, int]
+    ) -> list[dict[str, float | Follow]]:
+        """Place each [`Raised`] motor of `postures` at the end of its range gravity pulls away
+        from, a posture tried at both ends for a motor whose survey found no pull."""
+        resolved: list[dict[str, float | Follow]] = []
+        for posture in postures:
+            expanded: list[dict[str, float | Follow]] = [{}]
+            for other, place in posture.items():
+                if not isinstance(place, Raised):
+                    ends: tuple[float | Follow, ...] = (place,)
+                elif gravity.get(other, 0):
+                    ends = (1.0 if gravity[other] < 0 else 0.0,)
+                else:
+                    ends = (0.0, 1.0)
+                expanded = [{**partial, other: end} for partial in expanded for end in ends]
+            resolved += expanded
+        return resolved
+
     def record_calibration_from_hard_stops(
         self,
         mode: str,
@@ -1216,9 +1293,11 @@ class SerialMotorsBus(MotorsBusBase):
         motors: Sequence[str] | None = None,
         *,
         torque_limits: Sequence[int] = (),
-        postures: Mapping[str, Sequence[Mapping[str, float]]] | None = None,
+        postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
         confirm_tolerance: int = 15,
         return_tolerance: int = 80,
+        survey_ticks: int = 150,
+        gravity_threshold: int = 4,
         margin: int = 20,
         step: int = 8,
         stall_error: int = 40,
@@ -1263,16 +1342,23 @@ class SerialMotorsBus(MotorsBusBase):
             torque_limits (`Sequence[int]`, *optional*, defaults to `()`):
                 Raw `Torque_Limit` of a motor for each push towards a stop, weakest first.
                 Empty, or a motor without that register, pushes once at the motor's own limit.
-            postures (`Mapping[str, Sequence[Mapping[str, float]]]`, *optional*):
+            postures (`Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]]`, *optional*):
                 For a motor, the postures to search it from. A posture places motors searched
-                before it at a fraction of their range, 0 at its low end and 1 at its high end;
-                the others stay where they started. A motor without postures is searched once,
-                as the joints started.
+                before it at a fraction of their range, 0 at its low end and 1 at its high end,
+                [`Raised`] against gravity, or makes them [`Follow`] it as it turns; the others
+                stay where they started. A motor without postures is searched once, as the
+                joints started.
             confirm_tolerance (`int`, *optional*, defaults to `15`):
                 Ticks a stronger push may gain over the last one and still confirm the stop.
             return_tolerance (`int`, *optional*, defaults to `80`):
                 Ticks a joint going back to where it started, or to a posture, may settle away
                 from it: a joint holding a load sags short of its goal.
+            survey_ticks (`int`, *optional*, defaults to `150`):
+                Before any stop is sought, each joint searched is turned this far each way from
+                its start and back, at its own torque: where it settles tells the way gravity
+                pulls it, as it sags short of its goal on that side. 0 skips the survey.
+            gravity_threshold (`int`, *optional*, defaults to `4`):
+                Ticks of average sag below which the survey finds no pull.
             margin (`int`, *optional*, defaults to `20`):
                 Ticks between each stop and the end of the range recorded.
             step, stall_error, stall_cycles, period_s:
@@ -1298,7 +1384,11 @@ class SerialMotorsBus(MotorsBusBase):
             for posture in motor_postures:
                 if misplaced := [other for other in posture if other not in before]:
                     raise ValueError(f"Postures of '{motor}' place {misplaced}, not searched before it.")
-                if outside := [other for other, fraction in posture.items() if not 0 <= fraction <= 1]:
+                if outside := [
+                    other
+                    for other, place in posture.items()
+                    if not isinstance(place, (Follow, Raised)) and not 0 <= place <= 1
+                ]:
                     raise ValueError(f"Postures of '{motor}' place {outside} outside their range.")
 
         drive_modes = self._prepare_calibration(mode, motor_names, inverted_motors)
@@ -1318,6 +1408,20 @@ class SerialMotorsBus(MotorsBusBase):
             if delta := reading - (position + shifts[motor]):
                 shifts[motor] += self._shift_homing(motor, delta)
 
+        # The joints following the one searched in the current posture: their ratio, and where
+        # each was when the searched one was at its start.
+        followers: dict[str, tuple[float, int]] = {}
+
+        def follow(motor: str, goal: int) -> None:
+            turned = goal - shifts[motor] - starts[motor]
+            for other, (ratio, base) in followers.items():
+                target = base + shifts[other] + round(ratio * turned)
+                target = max(range_mins[other], min(range_maxes[other], target))
+                self.write("Goal_Position", other, target, normalize=False)
+
+        def on_step(motor: str) -> Callable[[int], None] | None:
+            return (lambda goal: follow(motor, goal)) if followers else None
+
         def seek(motor: str, direction: int) -> int:
             # Towards its low stop, a joint that runs out of encoder is re-homed to the middle of
             # its encoder and pushed on: its start need not be within half a turn of that stop.
@@ -1331,6 +1435,7 @@ class SerialMotorsBus(MotorsBusBase):
                         stall_error=stall_error,
                         stall_cycles=stall_cycles,
                         period_s=period_s,
+                        on_step=on_step(motor),
                     )
                     return reached - shifts[motor]
                 except EncoderEndError as end:
@@ -1341,7 +1446,17 @@ class SerialMotorsBus(MotorsBusBase):
 
         def move(motor: str, position: int) -> None:
             self.move_to_position(
-                motor, position + shifts[motor], step=step, period_s=period_s, tolerance=return_tolerance
+                motor,
+                position + shifts[motor],
+                step=step,
+                period_s=period_s,
+                tolerance=return_tolerance,
+                on_step=on_step(motor),
+            )
+
+        def move_raw(motor: str, target: int, settle: bool = False) -> int:
+            return self.move_to_position(
+                motor, target, step=step, period_s=period_s, tolerance=return_tolerance, settle=settle
             )
 
         try:
@@ -1353,12 +1468,29 @@ class SerialMotorsBus(MotorsBusBase):
                 self.write("Goal_Position", motor, position, normalize=False)
             self.enable_torque(motor_names)
 
+            # Survey: turn each joint a little each way to learn where gravity pulls it.
+            gravity = {
+                motor: self._survey_gravity(motor, survey_ticks, gravity_threshold, move_raw)
+                for motor in searched
+            }
+
             for motor in searched:
                 stops: dict[int, tuple[int, bool]] = {}
-                for posture in postures.get(motor) or [{}]:
-                    for other, fraction in posture.items():
-                        low, high = range_mins[other], range_maxes[other]
-                        move(other, round(low + fraction * (high - low)) - shifts[other])
+                for posture in self._resolve_raised(postures.get(motor) or [{}], gravity):
+                    for other, place in posture.items():
+                        if not isinstance(place, (Follow, Raised)):
+                            low, high = range_mins[other], range_maxes[other]
+                            move(other, round(low + place * (high - low)) - shifts[other])
+                    followers.update(
+                        {
+                            other: (
+                                place.ratio,
+                                int(self.read("Present_Position", other, normalize=False)) - shifts[other],
+                            )
+                            for other, place in posture.items()
+                            if isinstance(place, Follow)
+                        }
+                    )
                     for direction in (-1, 1):
                         stop, confirmed = self._seek_confirmed_stop(
                             motor, direction, torque_limits, confirm_tolerance, seek
@@ -1370,6 +1502,7 @@ class SerialMotorsBus(MotorsBusBase):
                             # The low stop at the bottom of the encoder leaves the high stop room.
                             rehome(motor, stops[-1][0], margin + _LOW_STOP_PARKING)
                         move(motor, starts[motor])
+                    followers.clear()
                     for other in posture:
                         move(other, starts[other])
                     logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")

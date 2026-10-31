@@ -424,7 +424,9 @@ lerobot-calibrate \
 Put the arm in the middle position shown above and clear everything within its reach before pressing ENTER. The joints are searched one at a time, gripper and wrist first and shoulder last, and each returns to its start after both stops are found. To reach the full range of every joint:
 
 - Each stop is pushed at increasing torques, `--robot.auto_calibration_torque_limits` (default `[150,300,500]`, i.e. 15%, 30%, 50%), and only counts once a stronger push gets no further, so a joint too weak to lift the arm at low torque is pushed again harder. A stop still moving at the strongest push is reported at the end.
-- The elbow is also searched with the wrist bent both ways, and the shoulder with the elbow folded and extended, so a stop that the table or another link hides in one posture is reached in another.
+- Before any stop is sought, each joint is turned a little each way and back: where it settles shows which way gravity pulls it.
+- The elbow is also searched with the wrist bent both ways. While the shoulder tips forward and back, the wrist is bent upward and the elbow turns against the shoulder to keep the hand up, so the shoulder reaches its stops before the hand reaches the table. A stop that the table or another link hides in one posture is reached in another.
+- A joint whose stop is more than half a turn from where it started is re-homed on the way, so the start pose need only be roughly the middle position.
 
 The leader arm, which is moved by hand, is still calibrated manually.
 

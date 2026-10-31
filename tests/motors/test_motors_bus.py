@@ -19,7 +19,7 @@ from unittest.mock import call, patch
 
 import pytest
 
-from lerobot.motors.motors_bus import Motor, MotorCalibration, MotorNormMode, SerialMotorsBus
+from lerobot.motors.motors_bus import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus
 from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import _require_package_cache
 from tests.mocks.mock_motors_bus import DUMMY_1, DUMMY_2, DUMMY_3, MockBus, MockMotorsBus
@@ -748,6 +748,58 @@ def test_record_calibration_from_hard_stops_tolerates_a_sagging_joint(arm, monke
     calibration = arm.record_calibration_from_hard_stops("position", full_turn_motors=["dummy_2", "dummy_3"])
 
     assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1067, 3027)
+
+
+def test_a_follower_keeps_the_hand_clear_of_the_table_while_the_shoulder_tips(arm, monkeypatch):
+    """`dummy_1` is a shoulder and `dummy_3` an elbow: the hand meets the table once the forearm
+    tips 400 ticks either way, so the shoulder reaches its stops only with the elbow cancelling
+    its turn. Following the other way only meets the table sooner, which the union overrides."""
+
+    def shoulder(joints: _Joints) -> tuple[int, int]:
+        elbow = joints.angles[3] - 2047
+        return max(1000, 2047 - 400 - elbow), min(3000, 2047 + 400 - elbow)
+
+    joints = _Joints(arm, {1: shoulder, 2: (0, 4095), 3: (500, 3600)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_1": [{}, {"dummy_3": Follow(1.0)}, {"dummy_3": Follow(-1.0)}]},
+    )
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1067, 3027)
+    assert joints.angles == {1: 2047, 2: 2047, 3: 2047}
+
+
+@pytest.mark.parametrize(
+    "sag, ends",
+    [(10, {"high"}), (-10, {"low"}), (0, {"low", "high"})],
+    ids=["pulled to lower readings", "pulled to higher readings", "no pull: both ends"],
+)
+def test_the_survey_raises_a_joint_against_gravity(sag, ends, arm, monkeypatch):
+    """`dummy_3`, a wrist, is raised while `dummy_1` is searched: at the end of its range gravity
+    pulls away from, as the survey felt it sag, or at both ends when it felt none."""
+    seen: set[str] = set()
+
+    def shoulder(joints: _Joints) -> tuple[int, int]:
+        wrist = joints.angles[3]
+        if abs(joints.angles[1] - 2047) > 200:  # the shoulder is being searched
+            seen.update({"high"} if wrist > 2500 else {"low"} if wrist < 1600 else set())
+        return 1000, 3000
+
+    joints = _Joints(arm, {1: shoulder, 2: (0, 4095), 3: (1500, 2600)}, sag={3: sag})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_1": [{"dummy_3": Raised()}]},
+    )
+
+    assert seen == ends
 
 
 def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blocked(arm, monkeypatch):

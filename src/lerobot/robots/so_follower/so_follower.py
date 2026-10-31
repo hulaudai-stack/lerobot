@@ -20,7 +20,7 @@ from functools import cached_property
 
 from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode, SerialMotorsBus
+from lerobot.motors import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -39,13 +39,19 @@ _HARD_STOP_SEARCH_ORDER = [
     "shoulder_pan",
     "wrist_roll",
 ]
-# Postures each joint is also searched from, placing joints searched before it at a fraction of their range:
-# a stop the table or another link hides in one posture is reached in another, and the range spans the
-# furthest stops of all. The wrist is bent both ways while the elbow folds onto the upper arm, and the
-# elbow both ways while the shoulder tips forward and back.
-_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float]]] = {
+# Postures each joint is also searched from: a stop the table or another link hides in one posture is reached
+# in another, and the range spans the furthest stops of all. The wrist is bent both ways while the elbow folds
+# onto the upper arm. While the shoulder tips forward and back, the wrist is bent upward, as the survey of the
+# joints found gravity pulling it, and the elbow turns against the shoulder to keep the hand up: whichever way
+# the servos are mounted, one of its two directions keeps the forearm level, and the other only meets the table
+# sooner, at a reduced torque.
+_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
     "elbow_flex": [{}, {"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
-    "shoulder_lift": [{}, {"elbow_flex": 0.15}, {"elbow_flex": 0.85}],
+    "shoulder_lift": [
+        {},
+        {"wrist_flex": Raised(), "elbow_flex": Follow(1.0)},
+        {"wrist_flex": Raised(), "elbow_flex": Follow(-1.0)},
+    ],
 }
 
 _HOMING_POSITION_DIAGRAM = r"""

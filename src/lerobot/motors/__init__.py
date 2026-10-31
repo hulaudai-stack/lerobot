@@ -16,10 +16,12 @@
 
 from .motors_bus import (
     DriveMode,
+    Follow,
     Motor,
     MotorCalibration,
     MotorNormMode,
+    Raised,
     SerialMotorsBus,
 )
 
-__all__ = ["DriveMode", "Motor", "MotorCalibration", "MotorNormMode", "SerialMotorsBus"]
+__all__ = ["DriveMode", "Follow", "Motor", "MotorCalibration", "MotorNormMode", "Raised", "SerialMotorsBus"]
