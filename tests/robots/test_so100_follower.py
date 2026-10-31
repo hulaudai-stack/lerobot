@@ -23,6 +23,7 @@ from lerobot.robots.so_follower import (
     SO100Follower,
     SO100FollowerConfig,
 )
+from lerobot.robots.so_follower.so_follower import _HARD_STOP_SEARCH_POSTURES
 
 
 def _make_bus_mock() -> MagicMock:
@@ -147,7 +148,7 @@ def test_send_action(follower):
 
 def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
     follower.config.auto_calibrate = True
-    follower.config.auto_calibration_torque_limit = 150
+    follower.config.auto_calibration_torque_limits = [150, 300]
     follower.calibration = {}
     monkeypatch.setattr("builtins.input", lambda prompt: "")
     follower.bus.record_calibration_from_hard_stops.return_value = {}
@@ -159,7 +160,8 @@ def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
         "position",
         full_turn_motors=["wrist_roll"],
         motors=["gripper", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan", "wrist_roll"],
-        torque_limit=150,
+        torque_limits=[150, 300],
+        postures=_HARD_STOP_SEARCH_POSTURES,
     )
     follower.bus.write_calibration.assert_called_once_with({})
 

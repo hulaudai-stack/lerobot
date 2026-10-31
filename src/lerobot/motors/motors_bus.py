@@ -19,7 +19,8 @@ from __future__ import annotations
 import abc
 import logging
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -1057,15 +1058,18 @@ class SerialMotorsBus(MotorsBusBase):
         step: int = 8,
         stall_error: int = 40,
         stall_cycles: int = 5,
+        still_ticks: int = 3,
         period_s: float = 0.02,
     ) -> int:
         """Drive a torque-enabled `motor` slowly in `direction` (+1 or -1) until it stalls.
 
         The raw goal moves `step` ticks every `period_s`. Once the joint lags the goal by more
-        than `stall_error` ticks the goal stops advancing, which caps how hard the joint pushes,
-        and the joint is stalled when it still lags after `stall_cycles` periods. The goal is
-        then set to the position reached, so the motor stops pushing. Limit the motor's torque
-        beforehand: a stall is the joint pressing on its stop.
+        than `stall_error` ticks the goal stops advancing, which caps how hard the joint pushes.
+        The joint is stalled when it lags the goal and has moved no more than `still_ticks` over
+        the last `stall_cycles` periods, so a joint that is slow but still moving, as one lifting
+        a load, is not mistaken for a stalled one. The goal is then set to the position reached,
+        so the motor stops pushing. Limit the motor's torque beforehand: a stall is the joint
+        pressing on its stop, or on whatever holds it back at that torque.
 
         Returns:
             `int`: The raw position where the joint stalled.
@@ -1079,17 +1083,18 @@ class SerialMotorsBus(MotorsBusBase):
             raise ValueError(f"direction must be +1 or -1, not {direction}.")
         max_position = self.resolution(self.motors[motor].model) - 1
         goal = int(self.read("Present_Position", motor, normalize=False))
-        stalled = 0
-        # The goal advances at most once per period, so this bounds the search.
-        for _ in range(4 * (max_position // step + stall_cycles)):
+        recent: deque[int] = deque(maxlen=stall_cycles + 1)
+        # The goal advances at most once per period; a joint that keeps creeping without ever
+        # catching up is bounded too.
+        for _ in range(10 * (max_position // step + stall_cycles)):
             position = int(self.read("Present_Position", motor, normalize=False))
-            if direction * (goal - position) > stall_error:
-                stalled += 1
-                if stalled >= stall_cycles:
-                    self.write("Goal_Position", motor, position, normalize=False)
-                    return position
-            else:
-                stalled = 0
+            recent.append(position)
+            lagging = direction * (goal - position) > stall_error
+            still = len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks
+            if lagging and still:
+                self.write("Goal_Position", motor, position, normalize=False)
+                return position
+            if not lagging:
                 goal += direction * step
                 if not 0 <= goal <= max_position:
                     self.write("Goal_Position", motor, position, normalize=False)
@@ -1098,7 +1103,44 @@ class SerialMotorsBus(MotorsBusBase):
                     )
                 self.write("Goal_Position", motor, goal, normalize=False)
             time.sleep(period_s)
+        self.write("Goal_Position", motor, position, normalize=False)
         raise RuntimeError(f"Motor '{motor}' neither stalled nor reached the end of its encoder.")
+
+    def _seek_confirmed_stop(
+        self,
+        motor: str,
+        direction: int,
+        torque_limits: Sequence[int],
+        confirm_tolerance: int,
+        seek: Callable[[str, int], int],
+    ) -> tuple[int, bool]:
+        """Seek the stop of `motor` in `direction` at each torque of `torque_limits` in turn,
+        each push starting where the last one stalled, until a stronger push gets no further
+        than `confirm_tolerance` ticks: then the stall is the stop, not a lack of torque. The
+        motor's own torque limit is back after each push.
+
+        Returns:
+            `tuple[int, bool]`: The furthest position reached, and whether it was confirmed. A
+            single push, or none at all without `Torque_Limit`, counts as confirmed.
+        """
+        limited = bool(torque_limits) and self._has_register(motor, "Torque_Limit")
+        limits: list[int | None] = list(torque_limits) if limited else [None]
+        own_limit = self.read("Torque_Limit", motor, normalize=False) if limited else None
+        furthest: int | None = None
+        for limit in limits:
+            if limit is not None:
+                self.write("Torque_Limit", motor, limit, normalize=False)
+            try:
+                stop = seek(motor, direction)
+            finally:
+                if own_limit is not None:
+                    self.write("Torque_Limit", motor, own_limit, normalize=False)
+            if furthest is not None and direction * (stop - furthest) <= confirm_tolerance:
+                return (stop if direction * (stop - furthest) > 0 else furthest), True
+            furthest = stop if furthest is None or direction * (stop - furthest) > 0 else furthest
+            logger.info(f"{motor}: stalled at {stop} with torque limit {limit}")
+        assert furthest is not None
+        return furthest, len(limits) == 1
 
     def record_calibration_from_hard_stops(
         self,
@@ -1107,7 +1149,9 @@ class SerialMotorsBus(MotorsBusBase):
         inverted_motors: Sequence[str] = (),
         motors: Sequence[str] | None = None,
         *,
-        torque_limit: int | None = None,
+        torque_limits: Sequence[int] = (),
+        postures: Mapping[str, Sequence[Mapping[str, float]]] | None = None,
+        confirm_tolerance: int = 15,
         margin: int = 20,
         step: int = 8,
         stall_error: int = 40,
@@ -1118,12 +1162,18 @@ class SerialMotorsBus(MotorsBusBase):
 
         The motors are prepared as in [`~SerialMotorsBus.record_calibration`], then the pose
         they are in becomes a half turn of each motor: it must be within half a turn of every
-        stop, so that no joint wraps around its encoder. Every motor is then held in place and,
-        one at a time in the order of `motors`, the others not full-turn are searched with
-        [`~SerialMotorsBus.find_hard_stop`] in both directions and returned to where they
-        started. Each range is the two stops brought `margin` ticks inward, so the joints are
-        never commanded into their stops afterwards. A full-turn motor is not searched: it
-        spans the whole encoder of its model.
+        stop, so that no joint wraps around its encoder. Every motor is then held in place and
+        the motors not full-turn are searched one at a time, in the order of `motors`.
+
+        A joint is searched in both directions, once per posture of the joints searched before
+        it (`postures`), and its range spans the furthest stops found over all of them: an
+        obstacle in one posture, as the table or another link, only makes that trial stop short,
+        so a stop met in another posture still counts. In each direction the joint is pushed at
+        each torque of `torque_limits` in turn until a stronger push gets no further, which tells
+        a stop from a joint too weak to lift its load. Between pushes and trials the joints go
+        back to where they started, at their own torque. Each range is the two stops brought
+        `margin` ticks inward, so the joints are never commanded into their stops afterwards. A
+        full-turn motor is not searched: it spans the whole encoder of its model.
 
         Like `record_calibration`, the homing offsets and position limits of the motors are
         rewritten, their torque is left off, and the calibration returned is neither written
@@ -1139,9 +1189,16 @@ class SerialMotorsBus(MotorsBusBase):
             motors (`Sequence[str]`, *optional*):
                 Motors to calibrate, in the order they are searched. `None` calibrates every
                 motor in the order of the bus.
-            torque_limit (`int`, *optional*):
-                Raw `Torque_Limit` of each motor while it is searched, restored afterwards.
-                `None`, or a motor without that register, keeps the motor's own limit.
+            torque_limits (`Sequence[int]`, *optional*, defaults to `()`):
+                Raw `Torque_Limit` of a motor for each push towards a stop, weakest first.
+                Empty, or a motor without that register, pushes once at the motor's own limit.
+            postures (`Mapping[str, Sequence[Mapping[str, float]]]`, *optional*):
+                For a motor, the postures to search it from. A posture places motors searched
+                before it at a fraction of their range, 0 at its low end and 1 at its high end;
+                the others stay where they started. A motor without postures is searched once,
+                as the joints started.
+            confirm_tolerance (`int`, *optional*, defaults to `15`):
+                Ticks a stronger push may gain over the last one and still confirm the stop.
             margin (`int`, *optional*, defaults to `20`):
                 Ticks between each stop and the end of the range recorded.
             step, stall_error, stall_cycles, period_s:
@@ -1151,18 +1208,31 @@ class SerialMotorsBus(MotorsBusBase):
             `dict[str, MotorCalibration]`: The calibration of each motor, in the order of the bus.
 
         Raises:
-            ValueError: If a motor is not on the bus, or a full-turn or inverted motor is not one
-                of the motors to calibrate; no motor has been touched then.
+            ValueError: If a motor is not on the bus, a full-turn or inverted motor is not one of
+                the motors to calibrate, or a posture places a motor not searched before the one
+                it is for, or outside its range; no motor has been touched then.
             RuntimeError: If a joint finds no stop, cannot return to its start, or its stops are
                 closer than twice `margin`. The torque of every motor is off then.
         """
         motor_names = self._select_calibration_motors(full_turn_motors, inverted_motors, motors)
+        searched = [motor for motor in motor_names if motor not in full_turn_motors]
+        postures = postures or {}
+        for motor, motor_postures in postures.items():
+            if motor not in searched:
+                raise ValueError(f"Postures are given for '{motor}', which is not searched.")
+            before = searched[: searched.index(motor)]
+            for posture in motor_postures:
+                if misplaced := [other for other in posture if other not in before]:
+                    raise ValueError(f"Postures of '{motor}' place {misplaced}, not searched before it.")
+                if outside := [other for other, fraction in posture.items() if not 0 <= fraction <= 1]:
+                    raise ValueError(f"Postures of '{motor}' place {outside} outside their range.")
+
         drive_modes = self._prepare_calibration(mode, motor_names, inverted_motors)
         homing_offsets = self.set_half_turn_homings(motor_names)
 
-        searched = [motor for motor in motor_names if motor not in full_turn_motors]
         range_mins: dict[str, int] = {}
         range_maxes: dict[str, int] = {}
+        unconfirmed: list[str] = []
 
         def seek(motor: str, direction: int) -> int:
             return self.find_hard_stop(
@@ -1174,36 +1244,56 @@ class SerialMotorsBus(MotorsBusBase):
                 period_s=period_s,
             )
 
+        def move(motor: str, target: int) -> None:
+            self.move_to_position(motor, target, step=step, period_s=period_s)
+
         try:
             # Hold every joint where it is, so the arm does not sag while one is searched.
-            for motor in motor_names:
-                position = self.read("Present_Position", motor, normalize=False)
+            starts = {
+                motor: int(self.read("Present_Position", motor, normalize=False)) for motor in motor_names
+            }
+            for motor, position in starts.items():
                 self.write("Goal_Position", motor, position, normalize=False)
             self.enable_torque(motor_names)
 
             for motor in searched:
-                start = int(self.read("Present_Position", motor, normalize=False))
-                limited = torque_limit is not None and self._has_register(motor, "Torque_Limit")
-                own_limit = self.read("Torque_Limit", motor, normalize=False) if limited else None
-                if limited:
-                    self.write("Torque_Limit", motor, torque_limit, normalize=False)
-                try:
-                    low = seek(motor, -1)
-                    self.move_to_position(motor, start, step=step, period_s=period_s)
-                    high = seek(motor, 1)
-                    self.move_to_position(motor, start, step=step, period_s=period_s)
-                finally:
-                    if own_limit is not None:
-                        self.write("Torque_Limit", motor, own_limit, normalize=False)
+                stops: dict[int, tuple[int, bool]] = {}
+                for posture in postures.get(motor) or [{}]:
+                    for other, fraction in posture.items():
+                        low, high = range_mins[other], range_maxes[other]
+                        move(other, round(low + fraction * (high - low)))
+                    for direction in (-1, 1):
+                        stop, confirmed = self._seek_confirmed_stop(
+                            motor, direction, torque_limits, confirm_tolerance, seek
+                        )
+                        move(motor, starts[motor])
+                        best = stops.get(direction)
+                        if best is None or direction * (stop - best[0]) > 0:
+                            stops[direction] = (stop, confirmed)
+                    for other in posture:
+                        move(other, starts[other])
+                    logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")
 
+                (low, low_confirmed), (high, high_confirmed) = stops[-1], stops[1]
                 if high - low <= 2 * margin:
                     raise RuntimeError(
                         f"Motor '{motor}' moved only {high - low} ticks between its stops: is it blocked?"
                     )
                 range_mins[motor], range_maxes[motor] = low + margin, high - margin
+                unconfirmed += [
+                    f"{motor} {end}"
+                    for end, ok in (("low", low_confirmed), ("high", high_confirmed))
+                    if not ok
+                ]
                 logger.info(f"{motor}: hard stops at {low} and {high}")
         finally:
             self.disable_torque(motor_names)
+
+        if unconfirmed:
+            logger.warning(
+                f"These stops were still moving at the strongest push, so the ranges may be short: {unconfirmed}."
+                " Raise the strongest torque limit, or check what holds these joints back."
+            )
 
         for motor in full_turn_motors:
             range_mins[motor] = 0

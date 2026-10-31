@@ -55,8 +55,10 @@ class SOFollowerConfig:
     # Experimental: calibrate by driving each joint slowly into its two mechanical stops, at a reduced torque,
     # instead of moving the arm by hand. Start from the rest position, with nothing within reach of the arm.
     auto_calibrate: bool = False
-    # `Torque_Limit` (0-1000, i.e. 0.1% steps of the maximum torque) of each joint while it seeks its stops.
-    auto_calibration_torque_limit: int = 200
+    # `Torque_Limit` (0-1000, i.e. 0.1% steps of the maximum torque) of each push of a joint towards a stop,
+    # weakest first: a stall counts as the stop once a stronger push gets no further, so a joint too weak to
+    # lift the arm at a low torque is pushed again harder.
+    auto_calibration_torque_limits: list[int] = field(default_factory=lambda: [150, 300, 500])
 
 
 @RobotConfig.register_subclass("so101_follower")

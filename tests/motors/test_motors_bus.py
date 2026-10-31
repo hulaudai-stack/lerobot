@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from unittest.mock import call, patch
 
 import pytest
@@ -531,20 +532,37 @@ def test_record_calibration_refuses_a_selection_before_touching_the_motors(selec
     assert (arm._bus.torques, arm._bus.writes) == ([], [])
 
 
-class _Joints:
-    """Physics for the `arm`: each `time.sleep` is a tick in which every joint follows its goal
-    at once, but no further than its hard stops."""
+type _Stops = tuple[int, int] | Callable[[MockBus], tuple[int, int]]
 
-    def __init__(self, arm: MockMotorsBus, stops: dict[int, tuple[int, int]], start: int = 2047):
-        self.arm, self.stops = arm, stops
+
+class _Joints:
+    """Physics for the `arm`: each `time.sleep` is a tick in which every joint moves towards its
+    goal, at most `speed` ticks, but no further than its stops. A stop may be a function of the
+    whole bus, so that it depends on the joint's torque limit or where another joint is."""
+
+    def __init__(self, arm: MockMotorsBus, stops: dict[int, _Stops], start: int = 2047, speed: int = 10_000):
+        self.arm, self.stops, self.speed = arm, stops, speed
         for id_ in arm.ids:
             arm._bus.seed(id_, "present_position", start)
             arm._bus.seed(id_, "goal_position", start)
 
     def tick(self, _seconds: float) -> None:
-        for id_, (low, high) in self.stops.items():
-            goal = self.arm._bus.stored(id_, "goal_position")
-            self.arm._bus.seed(id_, "present_position", max(low, min(high, goal)))
+        bus = self.arm._bus
+        for id_, stops in self.stops.items():
+            low, high = stops(bus) if callable(stops) else stops
+            present = bus.stored(id_, "present_position")
+            goal = bus.stored(id_, "goal_position")
+            moved = present + max(-self.speed, min(self.speed, goal - present))
+            bus.seed(id_, "present_position", max(low, min(high, moved)))
+
+
+@pytest.fixture
+def limited_arm(arm, monkeypatch):
+    """The `arm`, its motors with a `Torque_Limit` at its maximum."""
+    monkeypatch.setattr(DUMMY_3, "_registers", DUMMY_3._registers | {"torque_limit"})
+    for id_ in arm.ids:
+        arm._bus.seed(id_, "torque_limit", 1000)
+    return arm
 
 
 def test_find_hard_stop_returns_where_the_joint_stalls_and_stops_pushing(arm, monkeypatch):
@@ -556,6 +574,14 @@ def test_find_hard_stop_returns_where_the_joint_stalls_and_stops_pushing(arm, mo
     assert arm._bus.stored(1, "goal_position") == 1500
 
 
+def test_find_hard_stop_waits_for_a_slow_joint_that_still_moves(arm, monkeypatch):
+    """A joint trailing its goal by more than `stall_error` is not stalled while it moves."""
+    joints = _Joints(arm, {1: (1500, 2600)}, speed=5)
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    assert arm.find_hard_stop("dummy_1", 1, step=8, stall_error=40) == 2600
+
+
 def test_find_hard_stop_refuses_to_run_past_the_end_of_the_encoder(arm, monkeypatch):
     joints = _Joints(arm, {1: (0, 4095)})
     monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
@@ -564,22 +590,20 @@ def test_find_hard_stop_refuses_to_run_past_the_end_of_the_encoder(arm, monkeypa
         arm.find_hard_stop("dummy_1", 1)
 
 
-def test_record_calibration_from_hard_stops(arm, monkeypatch):
-    """Joints are searched in the order given at a reduced torque, returned to where they
-    started, and freed; ranges sit `margin` inside the stops, a full-turn motor spans its
+def test_record_calibration_from_hard_stops(limited_arm, monkeypatch):
+    """Joints are searched in the order given, each push at a reduced torque, returned to where
+    they started, and freed; ranges sit `margin` inside the stops, a full-turn motor spans its
     encoder."""
-    monkeypatch.setattr(DUMMY_3, "_registers", DUMMY_3._registers | {"torque_limit"})
+    arm = limited_arm
     joints = _Joints(arm, {1: (1000, 3000), 2: (0, 4095), 3: (1800, 2400)})
     monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
-    for id_ in arm.ids:
-        arm._bus.seed(id_, "torque_limit", 1000)
 
     calibration = arm.record_calibration_from_hard_stops(
         "position",
         full_turn_motors=["dummy_2"],
         inverted_motors=["dummy_3"],
         motors=["dummy_3", "dummy_1", "dummy_2"],
-        torque_limit=200,
+        torque_limits=[200],
         margin=20,
     )
 
@@ -589,9 +613,69 @@ def test_record_calibration_from_hard_stops(arm, monkeypatch):
         "dummy_3": MotorCalibration(id=3, drive_mode=1, homing_offset=0, range_min=1820, range_max=2380),
     }
     limits = [(id_, value) for id_, register, value in arm._bus.writes if register == "torque_limit"]
-    assert limits == [(3, 200), (3, 1000), (1, 200), (1, 1000)]
+    assert limits == [(3, 200), (3, 1000)] * 2 + [(1, 200), (1, 1000)] * 2
     assert [arm._bus.stored(id_, "present_position") for id_ in arm.ids] == [2047, 2047, 2047]
     assert arm._bus.torques[-1][:2] == ([3, 1, 2], False)
+
+
+def test_a_joint_too_weak_at_low_torque_is_pushed_harder_until_its_stop_holds(
+    limited_arm, monkeypatch, caplog
+):
+    """Lifting against gravity, the joint stalls short of its stop below a torque of 300."""
+    arm = limited_arm
+
+    def lifting(bus: MockBus) -> tuple[int, int]:
+        return 1000, (3000 if bus.stored(1, "torque_limit") >= 300 else 2300)
+
+    joints = _Joints(arm, {1: lifting, 2: (0, 4095), 3: (0, 4095)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops(
+        "position", full_turn_motors=["dummy_2", "dummy_3"], torque_limits=[150, 300, 500]
+    )
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1020, 2980)
+    assert "may be short" not in caplog.text
+
+
+def test_a_stop_still_moving_at_the_strongest_push_is_reported(limited_arm, monkeypatch, caplog):
+    arm = limited_arm
+
+    def giving_way(bus: MockBus) -> tuple[int, int]:
+        return 1000, 2000 + bus.stored(1, "torque_limit")
+
+    joints = _Joints(arm, {1: giving_way, 2: (0, 4095), 3: (0, 4095)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops(
+        "position", full_turn_motors=["dummy_2", "dummy_3"], torque_limits=[150, 300, 500]
+    )
+
+    assert calibration["dummy_1"].range_max == 2480
+    assert "may be short" in caplog.text
+    assert "dummy_1 high" in caplog.text
+
+
+def test_a_stop_hidden_by_an_obstacle_is_reached_from_another_posture(arm, monkeypatch):
+    """`dummy_1` meets an obstacle before its low stop unless `dummy_3` is near its low end, and
+    before its high stop unless `dummy_3` is near its high end: no single posture reaches both."""
+
+    def obstructed(bus: MockBus) -> tuple[int, int]:
+        other = bus.stored(3, "present_position")
+        return (1000 if other < 1900 else 1600), (3000 if other > 2300 else 2500)
+
+    joints = _Joints(arm, {1: obstructed, 2: (0, 4095), 3: (1800, 2400)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_1": [{}, {"dummy_3": 0.0}, {"dummy_3": 1.0}]},
+    )
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1020, 2980)
+    assert [arm._bus.stored(id_, "present_position") for id_ in arm.ids] == [2047, 2047, 2047]
 
 
 def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blocked(arm, monkeypatch):
@@ -604,9 +688,24 @@ def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blo
     assert arm._bus.torques[-1][:2] == ([1, 2, 3], False)
 
 
-def test_record_calibration_from_hard_stops_refuses_a_selection_before_touching_the_motors(arm):
-    with pytest.raises(ValueError, match="dummy_4"):
-        arm.record_calibration_from_hard_stops("position", full_turn_motors=["dummy_4"])
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"full_turn_motors": ["dummy_4"]},
+        {"postures": {"dummy_2": [{"dummy_1": 0.5}]}},
+        {"postures": {"dummy_1": [{"dummy_3": 0.5}]}},
+        {"postures": {"dummy_3": [{"dummy_1": 1.5}]}},
+    ],
+    ids=[
+        "unknown motor",
+        "posture of a full-turn motor",
+        "posture placing a motor searched later",
+        "posture outside a range",
+    ],
+)
+def test_record_calibration_from_hard_stops_refuses_a_selection_before_touching_the_motors(selection, arm):
+    with pytest.raises(ValueError, match="dummy_"):
+        arm.record_calibration_from_hard_stops("position", **{"full_turn_motors": ["dummy_2"], **selection})
 
     assert (arm._bus.torques, arm._bus.writes) == ([], [])
 

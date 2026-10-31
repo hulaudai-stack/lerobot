@@ -39,6 +39,14 @@ _HARD_STOP_SEARCH_ORDER = [
     "shoulder_pan",
     "wrist_roll",
 ]
+# Postures each joint is also searched from, placing joints searched before it at a fraction of their range:
+# a stop the table or another link hides in one posture is reached in another, and the range spans the
+# furthest stops of all. The wrist is bent both ways while the elbow folds onto the upper arm, and the
+# elbow both ways while the shoulder tips forward and back.
+_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float]]] = {
+    "elbow_flex": [{}, {"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
+    "shoulder_lift": [{}, {"elbow_flex": 0.15}, {"elbow_flex": 0.85}],
+}
 
 _HOMING_POSITION_DIAGRAM = r"""
        ╭─────┬────────────────────┬──────╮ ◉╲═════╗   ← moveable claw
@@ -168,7 +176,8 @@ class SOFollower(Robot):
             "position",
             full_turn_motors=["wrist_roll"],
             motors=_HARD_STOP_SEARCH_ORDER,
-            torque_limit=self.config.auto_calibration_torque_limit,
+            torque_limits=self.config.auto_calibration_torque_limits,
+            postures=_HARD_STOP_SEARCH_POSTURES,
         )
 
     def configure(self) -> None:
