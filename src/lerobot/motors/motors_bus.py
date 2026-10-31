@@ -1041,28 +1041,48 @@ class SerialMotorsBus(MotorsBusBase):
         return drive_modes
 
     def move_to_position(
-        self, motor: str, target: int, *, step: int = 8, period_s: float = 0.02, tolerance: int = 20
+        self,
+        motor: str,
+        target: int,
+        *,
+        step: int = 8,
+        period_s: float = 0.02,
+        tolerance: int = 20,
+        settle_cycles: int = 10,
+        still_ticks: int = 3,
     ) -> int:
         """Ramp the raw goal of a torque-enabled `motor` to `target`, `step` ticks every
-        `period_s`, so the joint never jumps, then wait until it is within `tolerance`.
+        `period_s`, so the joint never jumps, then wait until it is within `tolerance` of it.
+
+        A joint holding a load settles short of its goal, as a position-controlled servo sags
+        under gravity: once it has moved no more than `still_ticks` over `settle_cycles`
+        periods, it has gone as far as it will.
 
         Returns:
             `int`: The raw position reached.
 
         Raises:
-            RuntimeError: If the joint does not reach the target, e.g. it is blocked.
+            RuntimeError: If the joint settles further than `tolerance` from the target, e.g. it
+                is blocked, or never settles.
         """
         goal = int(self.read("Goal_Position", motor, normalize=False))
         while goal != target:
             goal += max(-step, min(step, target - goal))
             self.write("Goal_Position", motor, goal, normalize=False)
             time.sleep(period_s)
-        for _ in range(100):
+        recent: deque[int] = deque(maxlen=settle_cycles + 1)
+        for _ in range(20 * settle_cycles):
             position = int(self.read("Present_Position", motor, normalize=False))
+            recent.append(position)
             if abs(position - target) <= tolerance:
                 return position
+            if len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks:
+                break
             time.sleep(period_s)
-        raise RuntimeError(f"Motor '{motor}' did not reach position {target}; it stopped at {position}.")
+        raise RuntimeError(
+            f"Motor '{motor}' did not reach position {target}; it stopped at {position}, "
+            f"{abs(position - target)} ticks away. Is something in its way?"
+        )
 
     def find_hard_stop(
         self,
@@ -1198,6 +1218,7 @@ class SerialMotorsBus(MotorsBusBase):
         torque_limits: Sequence[int] = (),
         postures: Mapping[str, Sequence[Mapping[str, float]]] | None = None,
         confirm_tolerance: int = 15,
+        return_tolerance: int = 80,
         margin: int = 20,
         step: int = 8,
         stall_error: int = 40,
@@ -1249,6 +1270,9 @@ class SerialMotorsBus(MotorsBusBase):
                 as the joints started.
             confirm_tolerance (`int`, *optional*, defaults to `15`):
                 Ticks a stronger push may gain over the last one and still confirm the stop.
+            return_tolerance (`int`, *optional*, defaults to `80`):
+                Ticks a joint going back to where it started, or to a posture, may settle away
+                from it: a joint holding a load sags short of its goal.
             margin (`int`, *optional*, defaults to `20`):
                 Ticks between each stop and the end of the range recorded.
             step, stall_error, stall_cycles, period_s:
@@ -1316,7 +1340,9 @@ class SerialMotorsBus(MotorsBusBase):
             raise RuntimeError(f"Motor '{motor}' found no hard stop within a turn.")
 
         def move(motor: str, position: int) -> None:
-            self.move_to_position(motor, position + shifts[motor], step=step, period_s=period_s)
+            self.move_to_position(
+                motor, position + shifts[motor], step=step, period_s=period_s, tolerance=return_tolerance
+            )
 
         try:
             # Hold every joint where it is, so the arm does not sag while one is searched.

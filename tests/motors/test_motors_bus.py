@@ -540,10 +540,18 @@ class _Joints:
     shifted by the homing offset and wrapped around, as a Dynamixel-like dummy motor does. Each
     `time.sleep` is a tick in which every joint turns towards its goal, at most `speed` ticks,
     but no further than its stops. Stops may be a function of the joints, so that they depend
-    on a joint's torque limit or another joint's angle."""
+    on a joint's torque limit or another joint's angle. A joint with a `sag` settles that many
+    ticks below its goal, as one holding a load against gravity."""
 
-    def __init__(self, arm: MockMotorsBus, stops: dict[int, _Stops], start: int = 2047, speed: int = 10_000):
-        self.bus, self.stops, self.speed = arm._bus, stops, speed
+    def __init__(
+        self,
+        arm: MockMotorsBus,
+        stops: dict[int, _Stops],
+        start: int = 2047,
+        speed: int = 10_000,
+        sag: dict[int, int] | None = None,
+    ):
+        self.bus, self.stops, self.speed, self.sag = arm._bus, stops, speed, sag or {}
         self.angles = dict.fromkeys(arm.ids, start)
         self.resolution = arm.resolution("model_4")
         for id_ in arm.ids:
@@ -566,7 +574,7 @@ class _Joints:
             angle = self.angles[id_]
             target = self.bus.stored(id_, "goal_position") - self.bus.stored(id_, "homing_offset")
             # The goal is an encoder reading: the joint turns the shorter way to the angle it reads.
-            target += round((angle - target) / self.resolution) * self.resolution
+            target += round((angle - target) / self.resolution) * self.resolution - self.sag.get(id_, 0)
             turned = angle + max(-self.speed, min(self.speed, target - angle))
             self.angles[id_] = max(low, min(high, turned))
         self._encode()
@@ -721,6 +729,25 @@ def test_a_joint_without_stops_within_a_turn_is_refused(arm, monkeypatch):
         arm.record_calibration_from_hard_stops("position", full_turn_motors=["dummy_2", "dummy_3"])
 
     assert arm._bus.torques[-1][:2] == ([1, 2, 3], False)
+
+
+def test_move_to_position_accepts_a_joint_settled_within_tolerance(arm, monkeypatch):
+    """Sagging 30 ticks under its load, the joint is close enough at a tolerance of 80 only."""
+    joints = _Joints(arm, {1: (0, 4095)}, sag={1: 30})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    with pytest.raises(RuntimeError, match="30 ticks away"):
+        arm.move_to_position("dummy_1", 1200, tolerance=20)
+    assert arm.move_to_position("dummy_1", 1200, tolerance=80) == 1170
+
+
+def test_record_calibration_from_hard_stops_tolerates_a_sagging_joint(arm, monkeypatch):
+    joints = _Joints(arm, {1: (1000, 3000), 2: (0, 4095), 3: (0, 4095)}, sag={1: 30})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops("position", full_turn_motors=["dummy_2", "dummy_3"])
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1067, 3027)
 
 
 def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blocked(arm, monkeypatch):
