@@ -60,11 +60,6 @@ class Raised:
     upward, say. A posture with a motor whose survey found no pull is tried at both ends."""
 
 
-# Where an automatic calibration parks a joint's low stop, beyond its margin, before seeking the
-# high stop: near the bottom of the encoder, so the high stop fits whatever pose the joint started in.
-_LOW_STOP_PARKING = 100
-
-
 class EncoderEndError(RuntimeError):
     """A joint driven towards a stop reached the end of its encoder first, at `position`."""
 
@@ -1119,6 +1114,7 @@ class SerialMotorsBus(MotorsBusBase):
         stall_cycles: int = 5,
         still_ticks: int = 3,
         period_s: float = 0.02,
+        guard: int = 0,
         on_step: Callable[[int], None] | None = None,
     ) -> int:
         """Drive a torque-enabled `motor` slowly in `direction` (+1 or -1) until it stalls.
@@ -1133,13 +1129,19 @@ class SerialMotorsBus(MotorsBusBase):
         is called with each new raw goal: as the goal only advances, and holds once the joint
         is held back, joints moved along with it never push it back and forth.
 
+        The goal never comes within `guard` ticks of either end of the encoder, which leaves room
+        for a joint that falls past its goal, as one turning with gravity at a low torque does.
+        Should its reading still jump across the end of the encoder, its torque is turned off at
+        once: a servo told to go back would turn the long way round.
+
         Returns:
             `int`: The raw position where the joint stalled.
 
         Raises:
             ValueError: If `direction` is neither +1 nor -1.
-            RuntimeError: If the goal reaches the end of the encoder before any stall: the joint
-                has no stop within reach, or it would wrap around the encoder.
+            EncoderEndError: If the goal reaches the guard before any stall: the joint has no stop
+                within reach, or it would wrap around the encoder.
+            RuntimeError: If the reading wrapped around the encoder.
         """
         if direction not in (1, -1):
             raise ValueError(f"direction must be +1 or -1, not {direction}.")
@@ -1150,6 +1152,12 @@ class SerialMotorsBus(MotorsBusBase):
         # catching up is bounded too.
         for _ in range(10 * (max_position // step + stall_cycles)):
             position = int(self.read("Present_Position", motor, normalize=False))
+            if recent and abs(position - recent[-1]) > max_position // 2:
+                self.disable_torque(motor)
+                raise RuntimeError(
+                    f"Motor '{motor}' fell past the end of its encoder, from {recent[-1]} to {position}; "
+                    "its torque is off."
+                )
             recent.append(position)
             lagging = direction * (goal - position) > stall_error
             still = len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks
@@ -1158,7 +1166,7 @@ class SerialMotorsBus(MotorsBusBase):
                 return position
             if not lagging:
                 goal += direction * step
-                if not 0 <= goal <= max_position:
+                if not guard <= goal <= max_position - guard:
                     self.write("Goal_Position", motor, position, normalize=False)
                     raise EncoderEndError(
                         f"Motor '{motor}' found no hard stop before the end of its encoder at {position}.",
@@ -1300,8 +1308,9 @@ class SerialMotorsBus(MotorsBusBase):
         gravity_threshold: int = 4,
         margin: int = 20,
         step: int = 8,
-        stall_error: int = 40,
+        stall_error: int = 200,
         stall_cycles: int = 5,
+        guard: int = 150,
         period_s: float = 0.02,
     ) -> dict[str, MotorCalibration]:
         """Calibrate motors by driving each joint into its two hard stops, instead of by hand.
@@ -1361,8 +1370,11 @@ class SerialMotorsBus(MotorsBusBase):
                 Ticks of average sag below which the survey finds no pull.
             margin (`int`, *optional*, defaults to `20`):
                 Ticks between each stop and the end of the range recorded.
-            step, stall_error, stall_cycles, period_s:
-                Passed to [`~SerialMotorsBus.find_hard_stop`].
+            step, stall_error, stall_cycles, guard, period_s:
+                Passed to [`~SerialMotorsBus.find_hard_stop`]. `stall_error` is how far the goal may
+                lead a joint: a position servo pushes in proportion to it, so it must be large
+                enough for the push to reach the torque limit, or a stronger limit pushes no
+                harder. A joint never comes within `guard` ticks of the ends of its encoder.
 
         Returns:
             `dict[str, MotorCalibration]`: The calibration of each motor, in the order of the bus.
@@ -1422,10 +1434,22 @@ class SerialMotorsBus(MotorsBusBase):
         def on_step(motor: str) -> Callable[[int], None] | None:
             return (lambda goal: follow(motor, goal)) if followers else None
 
+        # The stops found so far of the joint searched: (position, confirmed) by direction.
+        stops: dict[int, tuple[int, bool]] = {}
+
+        def make_room(motor: str, direction: int, position: int) -> None:
+            """Re-home a joint that ran out of encoder towards `direction` at `position`: its stop
+            found the other way goes to the far end of the encoder, or with none found yet, where
+            it is goes to the middle."""
+            if (other := stops.get(-direction)) is None:
+                rehome(motor, position, middles[motor])
+            else:
+                edge = guard + margin if direction == 1 else 2 * middles[motor] + 1 - guard - margin
+                rehome(motor, other[0], edge)
+
         def seek(motor: str, direction: int) -> int:
-            # Towards its low stop, a joint that runs out of encoder is re-homed to the middle of
-            # its encoder and pushed on: its start need not be within half a turn of that stop.
-            # Towards its high stop, its low stop is parked at the bottom of the encoder already.
+            # A joint that runs out of encoder is re-homed to make room and pushed on: its start
+            # need not be within half a turn of its stops.
             for _ in range(2):
                 try:
                     reached = self.find_hard_stop(
@@ -1435,13 +1459,12 @@ class SerialMotorsBus(MotorsBusBase):
                         stall_error=stall_error,
                         stall_cycles=stall_cycles,
                         period_s=period_s,
+                        guard=guard,
                         on_step=on_step(motor),
                     )
                     return reached - shifts[motor]
                 except EncoderEndError as end:
-                    if direction == 1:
-                        raise
-                    rehome(motor, end.position - shifts[motor], middles[motor])
+                    make_room(motor, direction, end.position - shifts[motor])
             raise RuntimeError(f"Motor '{motor}' found no hard stop within a turn.")
 
         def move(motor: str, position: int) -> None:
@@ -1475,7 +1498,7 @@ class SerialMotorsBus(MotorsBusBase):
             }
 
             for motor in searched:
-                stops: dict[int, tuple[int, bool]] = {}
+                stops.clear()
                 for posture in self._resolve_raised(postures.get(motor) or [{}], gravity):
                     for other, place in posture.items():
                         if not isinstance(place, (Follow, Raised)):
@@ -1498,10 +1521,13 @@ class SerialMotorsBus(MotorsBusBase):
                         best = stops.get(direction)
                         if best is None or direction * (stop - best[0]) > 0:
                             stops[direction] = (stop, confirmed)
-                        if direction == -1:
-                            # The low stop at the bottom of the encoder leaves the high stop room.
-                            rehome(motor, stops[-1][0], margin + _LOW_STOP_PARKING)
+                        if direction == -1 and 1 not in stops:
+                            # The low stop near the bottom of the encoder leaves the high stop room.
+                            rehome(motor, stops[-1][0], guard + margin)
                         move(motor, starts[motor])
+                    # The range found so far centred on the encoder leaves room both ways for the
+                    # next posture, should it reach further, as a joint once too weak to lift.
+                    rehome(motor, (stops[-1][0] + stops[1][0]) // 2, middles[motor])
                     followers.clear()
                     for other in posture:
                         move(other, starts[other])

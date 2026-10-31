@@ -44,7 +44,8 @@ _HARD_STOP_SEARCH_ORDER = [
 # onto the upper arm. While the shoulder tips forward and back, the wrist is bent upward, as the survey of the
 # joints found gravity pulling it, and the elbow turns against the shoulder to keep the hand up: whichever way
 # the servos are mounted, one of its two directions keeps the forearm level, and the other only meets the table
-# sooner, at a reduced torque.
+# sooner, at a reduced torque. The shoulder pans with the forearm raised and the wrist straight, the arm a
+# column over the base, so the hand does not sweep into a wall behind it.
 _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
     "elbow_flex": [{}, {"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
     "shoulder_lift": [
@@ -52,6 +53,7 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] 
         {"wrist_flex": Raised(), "elbow_flex": Follow(1.0)},
         {"wrist_flex": Raised(), "elbow_flex": Follow(-1.0)},
     ],
+    "shoulder_pan": [{"elbow_flex": Raised(), "wrist_flex": 0.5}],
 }
 
 _HOMING_POSITION_DIAGRAM = r"""

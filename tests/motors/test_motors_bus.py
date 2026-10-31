@@ -606,6 +606,19 @@ def test_find_hard_stop_waits_for_a_slow_joint_that_still_moves(arm, monkeypatch
     assert arm.find_hard_stop("dummy_1", 1, step=8, stall_error=40) == 2600
 
 
+def test_find_hard_stop_frees_a_joint_that_falls_past_the_end_of_its_encoder(arm, monkeypatch):
+    """Sagging 100 ticks below its goal, the joint reads across the end of its encoder before its
+    goal reaches it: its torque goes off rather than its servo turning the long way back."""
+    joints = _Joints(arm, {1: (-500, 4095)}, start=150, sag={1: 100})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.enable_torque()
+
+    with pytest.raises(RuntimeError, match="fell past the end of its encoder"):
+        arm.find_hard_stop("dummy_1", -1)
+
+    assert arm._bus.stored(1, "torque_enable") == 0
+
+
 def test_find_hard_stop_refuses_to_run_past_the_end_of_the_encoder(arm, monkeypatch):
     joints = _Joints(arm, {1: (0, 4095)})
     monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
