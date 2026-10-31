@@ -967,21 +967,8 @@ class SerialMotorsBus(MotorsBusBase):
             ValueError: If a motor is not on the bus, or a full-turn or inverted motor is not one
                 of the motors to calibrate; no motor has been touched then.
         """
-        motor_names = self._get_motors_list(motors)
-        if unknown := [motor for motor in motor_names if motor not in self.motors]:
-            raise ValueError(f"Motors {unknown} are not on the bus.")
-        if outside := [motor for motor in (*full_turn_motors, *inverted_motors) if motor not in motor_names]:
-            raise ValueError(f"Motors {outside} are not among the motors to calibrate: {motor_names}.")
-
-        self.disable_torque(motor_names)
-        self.set_operating_mode(mode, motor_names)
-        drive_modes = {
-            motor: (DriveMode.INVERTED if motor in inverted_motors else DriveMode.NON_INVERTED).value
-            for motor in motor_names
-        }
-        for motor, drive_mode in drive_modes.items():
-            if self._has_register(motor, "Drive_Mode"):
-                self.write("Drive_Mode", motor, drive_mode)
+        motor_names = self._select_calibration_motors(full_turn_motors, inverted_motors, motors)
+        drive_modes = self._prepare_calibration(mode, motor_names, inverted_motors)
 
         input("Move the joints to the middle of their range of motion and press ENTER....")
         homing_offsets = self.set_half_turn_homings(motor_names)
@@ -1005,6 +992,233 @@ class SerialMotorsBus(MotorsBusBase):
                 range_max=int(range_maxes[motor]),
             )
             for motor in motor_names
+        }
+
+    def _select_calibration_motors(
+        self,
+        full_turn_motors: Sequence[str],
+        inverted_motors: Sequence[str],
+        motors: Sequence[str] | None,
+    ) -> list[str]:
+        """The motors to calibrate, once checked: all on the bus, and every full-turn or
+        inverted motor among them. Nothing is written to the motors."""
+        motor_names = self._get_motors_list(motors)
+        if unknown := [motor for motor in motor_names if motor not in self.motors]:
+            raise ValueError(f"Motors {unknown} are not on the bus.")
+        if outside := [motor for motor in (*full_turn_motors, *inverted_motors) if motor not in motor_names]:
+            raise ValueError(f"Motors {outside} are not among the motors to calibrate: {motor_names}.")
+        return motor_names
+
+    def _prepare_calibration(
+        self, mode: str, motor_names: list[str], inverted_motors: Sequence[str]
+    ) -> dict[str, int]:
+        """Free the motors, put them in `mode` and give them their direction. Returns the drive
+        mode of each motor, written to those with a `Drive_Mode` register."""
+        self.disable_torque(motor_names)
+        self.set_operating_mode(mode, motor_names)
+        drive_modes = {
+            motor: (DriveMode.INVERTED if motor in inverted_motors else DriveMode.NON_INVERTED).value
+            for motor in motor_names
+        }
+        for motor, drive_mode in drive_modes.items():
+            if self._has_register(motor, "Drive_Mode"):
+                self.write("Drive_Mode", motor, drive_mode)
+        return drive_modes
+
+    def move_to_position(
+        self, motor: str, target: int, *, step: int = 8, period_s: float = 0.02, tolerance: int = 20
+    ) -> int:
+        """Ramp the raw goal of a torque-enabled `motor` to `target`, `step` ticks every
+        `period_s`, so the joint never jumps, then wait until it is within `tolerance`.
+
+        Returns:
+            `int`: The raw position reached.
+
+        Raises:
+            RuntimeError: If the joint does not reach the target, e.g. it is blocked.
+        """
+        goal = int(self.read("Goal_Position", motor, normalize=False))
+        while goal != target:
+            goal += max(-step, min(step, target - goal))
+            self.write("Goal_Position", motor, goal, normalize=False)
+            time.sleep(period_s)
+        for _ in range(100):
+            position = int(self.read("Present_Position", motor, normalize=False))
+            if abs(position - target) <= tolerance:
+                return position
+            time.sleep(period_s)
+        raise RuntimeError(f"Motor '{motor}' did not reach position {target}; it stopped at {position}.")
+
+    def find_hard_stop(
+        self,
+        motor: str,
+        direction: int,
+        *,
+        step: int = 8,
+        stall_error: int = 40,
+        stall_cycles: int = 5,
+        period_s: float = 0.02,
+    ) -> int:
+        """Drive a torque-enabled `motor` slowly in `direction` (+1 or -1) until it stalls.
+
+        The raw goal moves `step` ticks every `period_s`. Once the joint lags the goal by more
+        than `stall_error` ticks the goal stops advancing, which caps how hard the joint pushes,
+        and the joint is stalled when it still lags after `stall_cycles` periods. The goal is
+        then set to the position reached, so the motor stops pushing. Limit the motor's torque
+        beforehand: a stall is the joint pressing on its stop.
+
+        Returns:
+            `int`: The raw position where the joint stalled.
+
+        Raises:
+            ValueError: If `direction` is neither +1 nor -1.
+            RuntimeError: If the goal reaches the end of the encoder before any stall: the joint
+                has no stop within reach, or it would wrap around the encoder.
+        """
+        if direction not in (1, -1):
+            raise ValueError(f"direction must be +1 or -1, not {direction}.")
+        max_position = self.resolution(self.motors[motor].model) - 1
+        goal = int(self.read("Present_Position", motor, normalize=False))
+        stalled = 0
+        # The goal advances at most once per period, so this bounds the search.
+        for _ in range(4 * (max_position // step + stall_cycles)):
+            position = int(self.read("Present_Position", motor, normalize=False))
+            if direction * (goal - position) > stall_error:
+                stalled += 1
+                if stalled >= stall_cycles:
+                    self.write("Goal_Position", motor, position, normalize=False)
+                    return position
+            else:
+                stalled = 0
+                goal += direction * step
+                if not 0 <= goal <= max_position:
+                    self.write("Goal_Position", motor, position, normalize=False)
+                    raise RuntimeError(
+                        f"Motor '{motor}' found no hard stop before the end of its encoder at {position}."
+                    )
+                self.write("Goal_Position", motor, goal, normalize=False)
+            time.sleep(period_s)
+        raise RuntimeError(f"Motor '{motor}' neither stalled nor reached the end of its encoder.")
+
+    def record_calibration_from_hard_stops(
+        self,
+        mode: str,
+        full_turn_motors: Sequence[str],
+        inverted_motors: Sequence[str] = (),
+        motors: Sequence[str] | None = None,
+        *,
+        torque_limit: int | None = None,
+        margin: int = 20,
+        step: int = 8,
+        stall_error: int = 40,
+        stall_cycles: int = 5,
+        period_s: float = 0.02,
+    ) -> dict[str, MotorCalibration]:
+        """Calibrate motors by driving each joint into its two hard stops, instead of by hand.
+
+        The motors are prepared as in [`~SerialMotorsBus.record_calibration`], then the pose
+        they are in becomes a half turn of each motor: it must be within half a turn of every
+        stop, so that no joint wraps around its encoder. Every motor is then held in place and,
+        one at a time in the order of `motors`, the others not full-turn are searched with
+        [`~SerialMotorsBus.find_hard_stop`] in both directions and returned to where they
+        started. Each range is the two stops brought `margin` ticks inward, so the joints are
+        never commanded into their stops afterwards. A full-turn motor is not searched: it
+        spans the whole encoder of its model.
+
+        Like `record_calibration`, the homing offsets and position limits of the motors are
+        rewritten, their torque is left off, and the calibration returned is neither written
+        to the position limits nor saved.
+
+        Args:
+            mode (`str`):
+                Operating mode of the motors, e.g. `"position"`.
+            full_turn_motors (`Sequence[str]`):
+                Motors given the whole encoder range instead of being searched.
+            inverted_motors (`Sequence[str]`, *optional*, defaults to `()`):
+                Motors turning the other way.
+            motors (`Sequence[str]`, *optional*):
+                Motors to calibrate, in the order they are searched. `None` calibrates every
+                motor in the order of the bus.
+            torque_limit (`int`, *optional*):
+                Raw `Torque_Limit` of each motor while it is searched, restored afterwards.
+                `None`, or a motor without that register, keeps the motor's own limit.
+            margin (`int`, *optional*, defaults to `20`):
+                Ticks between each stop and the end of the range recorded.
+            step, stall_error, stall_cycles, period_s:
+                Passed to [`~SerialMotorsBus.find_hard_stop`].
+
+        Returns:
+            `dict[str, MotorCalibration]`: The calibration of each motor, in the order of the bus.
+
+        Raises:
+            ValueError: If a motor is not on the bus, or a full-turn or inverted motor is not one
+                of the motors to calibrate; no motor has been touched then.
+            RuntimeError: If a joint finds no stop, cannot return to its start, or its stops are
+                closer than twice `margin`. The torque of every motor is off then.
+        """
+        motor_names = self._select_calibration_motors(full_turn_motors, inverted_motors, motors)
+        drive_modes = self._prepare_calibration(mode, motor_names, inverted_motors)
+        homing_offsets = self.set_half_turn_homings(motor_names)
+
+        searched = [motor for motor in motor_names if motor not in full_turn_motors]
+        range_mins: dict[str, int] = {}
+        range_maxes: dict[str, int] = {}
+
+        def seek(motor: str, direction: int) -> int:
+            return self.find_hard_stop(
+                motor,
+                direction,
+                step=step,
+                stall_error=stall_error,
+                stall_cycles=stall_cycles,
+                period_s=period_s,
+            )
+
+        try:
+            # Hold every joint where it is, so the arm does not sag while one is searched.
+            for motor in motor_names:
+                position = self.read("Present_Position", motor, normalize=False)
+                self.write("Goal_Position", motor, position, normalize=False)
+            self.enable_torque(motor_names)
+
+            for motor in searched:
+                start = int(self.read("Present_Position", motor, normalize=False))
+                limited = torque_limit is not None and self._has_register(motor, "Torque_Limit")
+                own_limit = self.read("Torque_Limit", motor, normalize=False) if limited else None
+                if limited:
+                    self.write("Torque_Limit", motor, torque_limit, normalize=False)
+                try:
+                    low = seek(motor, -1)
+                    self.move_to_position(motor, start, step=step, period_s=period_s)
+                    high = seek(motor, 1)
+                    self.move_to_position(motor, start, step=step, period_s=period_s)
+                finally:
+                    if own_limit is not None:
+                        self.write("Torque_Limit", motor, own_limit, normalize=False)
+
+                if high - low <= 2 * margin:
+                    raise RuntimeError(
+                        f"Motor '{motor}' moved only {high - low} ticks between its stops: is it blocked?"
+                    )
+                range_mins[motor], range_maxes[motor] = low + margin, high - margin
+                logger.info(f"{motor}: hard stops at {low} and {high}")
+        finally:
+            self.disable_torque(motor_names)
+
+        for motor in full_turn_motors:
+            range_mins[motor] = 0
+            range_maxes[motor] = self.resolution(self.motors[motor].model) - 1
+
+        return {
+            motor: MotorCalibration(
+                id=self.motors[motor].id,
+                drive_mode=drive_modes[motor],
+                homing_offset=int(homing_offsets[motor]),
+                range_min=int(range_mins[motor]),
+                range_max=int(range_maxes[motor]),
+            )
+            for motor in self.motors
+            if motor in motor_names
         }
 
     def _normalize(self, ids_values: dict[int, int]) -> dict[int, float]:

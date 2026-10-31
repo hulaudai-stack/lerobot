@@ -409,6 +409,20 @@ The video below shows how to perform the calibration. First you need to move the
   </video>
 </div>
 
+##### Automatic calibration (experimental)
+
+Instead of moving the joints by hand, the follower can find its ranges itself by driving each joint slowly into its mechanical stops, at a reduced torque:
+
+```bash
+lerobot-calibrate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/tty.usbmodem58760431551 \
+    --robot.id=my_awesome_follower_arm \
+    --robot.auto_calibrate=true
+```
+
+Put the arm in the middle position shown above and clear everything within its reach before pressing ENTER. The joints are searched one at a time, gripper and wrist first and shoulder last, and each returns to its start after both stops are found. The torque used while searching is set with `--robot.auto_calibration_torque_limit` (default `200`, i.e. 20%): raise it if a joint stops early because of gravity, lower it to protect the gears. A joint that meets the table or the base before its mechanical stop will record that obstacle as its limit. The leader arm, which is moved by hand, is still calibrated manually.
+
 #### Leader
 
 Do the same steps to calibrate the leader arm, run the following command or API example:

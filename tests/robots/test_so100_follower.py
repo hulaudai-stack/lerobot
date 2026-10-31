@@ -145,6 +145,25 @@ def test_send_action(follower):
     follower.bus.sync_write.assert_called_once_with("Goal_Position", goal_pos)
 
 
+def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
+    follower.config.auto_calibrate = True
+    follower.config.auto_calibration_torque_limit = 150
+    follower.calibration = {}
+    monkeypatch.setattr("builtins.input", lambda prompt: "")
+    follower.bus.record_calibration_from_hard_stops.return_value = {}
+
+    follower.calibrate()
+
+    follower.bus.record_calibration.assert_not_called()
+    follower.bus.record_calibration_from_hard_stops.assert_called_once_with(
+        "position",
+        full_turn_motors=["wrist_roll"],
+        motors=["gripper", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan", "wrist_roll"],
+        torque_limit=150,
+    )
+    follower.bus.write_calibration.assert_called_once_with({})
+
+
 def test_configure_writes_position_pid_coefficients():
     bus_mock = _make_bus_mock()
     bus_mock.motors = ["shoulder_pan"]

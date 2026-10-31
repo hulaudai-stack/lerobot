@@ -52,6 +52,12 @@ class SOFollowerConfig:
     # failure, so the steady-state read cost is unchanged.
     num_read_retries: int = 2
 
+    # Experimental: calibrate by driving each joint slowly into its two mechanical stops, at a reduced torque,
+    # instead of moving the arm by hand. Start from the rest position, with nothing within reach of the arm.
+    auto_calibrate: bool = False
+    # `Torque_Limit` (0-1000, i.e. 0.1% steps of the maximum torque) of each joint while it seeks its stops.
+    auto_calibration_torque_limit: int = 200
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")

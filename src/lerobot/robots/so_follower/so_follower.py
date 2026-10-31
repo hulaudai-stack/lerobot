@@ -20,7 +20,7 @@ from functools import cached_property
 
 from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
-from lerobot.motors import Motor, MotorNormMode, SerialMotorsBus
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode, SerialMotorsBus
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -28,6 +28,17 @@ from ..utils import ensure_safe_goal_position
 from .config_so_follower import SOFollowerRobotConfig
 
 logger = logging.getLogger(__name__)
+
+# Order in which automatic calibration searches the joints' stops: the wrist and gripper while the arm
+# is still compact, the shoulder last. `wrist_roll` turns freely, so it is homed but not searched.
+_HARD_STOP_SEARCH_ORDER = [
+    "gripper",
+    "wrist_flex",
+    "elbow_flex",
+    "shoulder_lift",
+    "shoulder_pan",
+    "wrist_roll",
+]
 
 _HOMING_POSITION_DIAGRAM = r"""
        ╭─────┬────────────────────┬──────╮ ◉╲═════╗   ← moveable claw
@@ -136,11 +147,29 @@ class SOFollower(Robot):
             return
 
         print(_HOMING_POSITION_DIAGRAM)
-        print("Video walkthrough: https://huggingface.co/docs/lerobot/main/en/so101#calibration-video")
-        self.calibration = self.bus.record_calibration("position", full_turn_motors=["wrist_roll"])
+        if self.config.auto_calibrate:
+            self.calibration = self._calibrate_from_hard_stops()
+        else:
+            print("Video walkthrough: https://huggingface.co/docs/lerobot/main/en/so101#calibration-video")
+            self.calibration = self.bus.record_calibration("position", full_turn_motors=["wrist_roll"])
         self.bus.write_calibration(self.calibration)
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
+
+    def _calibrate_from_hard_stops(self) -> dict[str, MotorCalibration]:
+        """Find the range of each joint by driving it into its mechanical stops, distal joints
+        first so the arm stays compact while the shoulder is searched."""
+        input(
+            "Automatic calibration (experimental): each joint will move slowly until it meets its\n"
+            "mechanical stops. Put the arm in the pose above, clear everything within reach of it,\n"
+            "and keep a hand near the power switch. Press ENTER to start, Ctrl+C to abort..."
+        )
+        return self.bus.record_calibration_from_hard_stops(
+            "position",
+            full_turn_motors=["wrist_roll"],
+            motors=_HARD_STOP_SEARCH_ORDER,
+            torque_limit=self.config.auto_calibration_torque_limit,
+        )
 
     def configure(self) -> None:
         with self.bus.torque_disabled():
