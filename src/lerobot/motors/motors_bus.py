@@ -46,8 +46,8 @@ _TRANSPORT_ERRORS = (RuntimeError, OSError)
 @dataclass(frozen=True)
 class Follow:
     """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor that
-    follows the one searched: it turns `ratio` ticks for each tick the goal of the searched one
-    turns from where it started, within its own range. A ratio of 1 or -1 makes a joint cancel the turn of
+    follows the one searched: it turns `ratio` ticks for each tick the searched one has turned
+    from where it started, within its own range. A ratio of 1 or -1 makes a joint cancel the turn of
     the one searched, e.g. an elbow keeping the forearm level while the shoulder tips."""
 
     ratio: float
@@ -1071,8 +1071,8 @@ class SerialMotorsBus(MotorsBusBase):
         A joint holding a load settles short of its goal, as a position-controlled servo sags
         under gravity: once it has moved no more than `still_ticks` over `settle_cycles`
         periods, it has gone as far as it will. With `settle`, the joint is always left to settle,
-        and the position returned is where it came to rest. `on_step`, if given, is called with
-        each raw goal of the ramp, e.g. to move other joints along with it.
+        and the position returned is where it came to rest. `on_step`, if given, is called every
+        period with the raw position of the joint, e.g. to move other joints along with it.
 
         Returns:
             `int`: The raw position reached.
@@ -1086,12 +1086,14 @@ class SerialMotorsBus(MotorsBusBase):
             goal += max(-step, min(step, target - goal))
             self.write("Goal_Position", motor, goal, normalize=False)
             if on_step is not None:
-                on_step(goal)
+                on_step(int(self.read("Present_Position", motor, normalize=False)))
             time.sleep(period_s)
         recent: deque[int] = deque(maxlen=settle_cycles + 1)
         for _ in range(20 * settle_cycles):
             position = int(self.read("Present_Position", motor, normalize=False))
             recent.append(position)
+            if on_step is not None:
+                on_step(position)
             if not settle and abs(position - target) <= tolerance:
                 return position
             if len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks:
@@ -1126,8 +1128,7 @@ class SerialMotorsBus(MotorsBusBase):
         a load, is not mistaken for a stalled one. The goal is then set to the position reached,
         so the motor stops pushing. Limit the motor's torque beforehand: a stall is the joint
         pressing on its stop, or on whatever holds it back at that torque. `on_step`, if given,
-        is called with each new raw goal: as the goal only advances, and holds once the joint
-        is held back, joints moved along with it never push it back and forth.
+        is called every period with the raw position of the joint.
 
         The goal never comes within `guard` ticks of either end of the encoder, which leaves room
         for a joint that falls past its goal, as one turning with gravity at a low torque does.
@@ -1159,6 +1160,8 @@ class SerialMotorsBus(MotorsBusBase):
                     "its torque is off."
                 )
             recent.append(position)
+            if on_step is not None:
+                on_step(position)
             lagging = direction * (goal - position) > stall_error
             still = len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks
             if lagging and still:
@@ -1173,8 +1176,6 @@ class SerialMotorsBus(MotorsBusBase):
                         position,
                     )
                 self.write("Goal_Position", motor, goal, normalize=False)
-                if on_step is not None:
-                    on_step(goal)
             time.sleep(period_s)
         self.write("Goal_Position", motor, position, normalize=False)
         raise RuntimeError(f"Motor '{motor}' neither stalled nor reached the end of its encoder.")
@@ -1424,15 +1425,23 @@ class SerialMotorsBus(MotorsBusBase):
         # each was when the searched one was at its start.
         followers: dict[str, tuple[float, int]] = {}
 
-        def follow(motor: str, goal: int) -> None:
-            turned = goal - shifts[motor] - starts[motor]
+        # How far the searched joint has turned from its start, as its followers see it: a ratchet
+        # that only moves in the direction the joint is driven (`motion`), so followers neither
+        # lead the joint, as following its goal would when it is held back, nor go back and forth.
+        follow_state = {"turned": 0, "motion": 0}
+
+        def follow(motor: str, reading: int) -> None:
+            turned = reading - shifts[motor] - starts[motor]
+            if follow_state["motion"] * (turned - follow_state["turned"]) <= 0:
+                return
+            follow_state["turned"] = turned
             for other, (ratio, base) in followers.items():
-                target = base + shifts[other] + round(ratio * turned)
+                target = base + shifts[other] + round(ratio * follow_state["turned"])
                 target = max(range_mins[other], min(range_maxes[other], target))
                 self.write("Goal_Position", other, target, normalize=False)
 
         def on_step(motor: str) -> Callable[[int], None] | None:
-            return (lambda goal: follow(motor, goal)) if followers else None
+            return (lambda reading: follow(motor, reading)) if followers else None
 
         # The stops found so far of the joint searched: (position, confirmed) by direction.
         stops: dict[int, tuple[int, bool]] = {}
@@ -1450,6 +1459,7 @@ class SerialMotorsBus(MotorsBusBase):
         def seek(motor: str, direction: int) -> int:
             # A joint that runs out of encoder is re-homed to make room and pushed on: its start
             # need not be within half a turn of its stops.
+            follow_state["motion"] = direction
             for _ in range(2):
                 try:
                     reached = self.find_hard_stop(
@@ -1468,6 +1478,8 @@ class SerialMotorsBus(MotorsBusBase):
             raise RuntimeError(f"Motor '{motor}' found no hard stop within a turn.")
 
         def move(motor: str, position: int) -> None:
+            current = int(self.read("Present_Position", motor, normalize=False)) - shifts[motor]
+            follow_state["motion"] = (position > current) - (position < current)
             self.move_to_position(
                 motor,
                 position + shifts[motor],
@@ -1504,6 +1516,7 @@ class SerialMotorsBus(MotorsBusBase):
                         if not isinstance(place, (Follow, Raised)):
                             low, high = range_mins[other], range_maxes[other]
                             move(other, round(low + place * (high - low)) - shifts[other])
+                    follow_state["turned"] = 0
                     followers.update(
                         {
                             other: (
