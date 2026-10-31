@@ -1,0 +1,313 @@
+"""Test the SO-101 automatic calibration from many starting points, then tune its settings.
+
+Runs unattended and can be resumed: everything is saved under OUT_DIR as it goes.
+
+    python optimize.py OUT_DIR [--scenarios 24] [--candidates 24] [--workers 2]
+
+Phase 1, robustness: the current settings against scenarios that each draw a servo assembly
+(mounting angle and direction of every encoder), a start pose anywhere within the middle ~45% of
+each joint's range, and a wall 3.5 cm to 20 cm behind the base, or none.
+
+Phase 2, optimisation: random settings (ramp speed, torque ladder, stall detection, survey size,
+postures searched) by successive halving. A candidate that misses a single stop by more than
+3 degrees in any scenario is out; the others are ranked by calibration time, and the fastest are
+tried on more scenarios. Results go to OUT_DIR/leaderboard.md as they come.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import random
+import sys
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+REACHABLE = {"elbow_flex": (-96.8, 90.4)}
+TOLERANCE_DEG = 3.0
+WALL_GAPS = [0.035, 0.04, 0.06, 0.10, 0.20, None]
+
+# Postures each candidate may search from, by name. "default" is what LeRobot ships.
+POSTURE_SETS = {
+    "default": None,
+    "lean_shoulder": {"shoulder_lift": "follow_only"},
+    "lean_elbow": {"elbow_flex": "wrist_bent_only"},
+    "lean_both": {"shoulder_lift": "follow_only", "elbow_flex": "wrist_bent_only"},
+}
+
+DEFAULTS = {
+    "step": 8,
+    "torque_limits": [150, 300, 500],
+    "stall_error": 200,
+    "stall_cycles": 5,
+    "survey_ticks": 150,
+    "postures": "default",
+}
+SPACE = {
+    "step": [8, 12, 16, 24],
+    "torque_limits": [[150, 300, 500], [200, 500], [250, 500], [150, 500]],
+    "stall_error": [150, 200, 300],
+    "stall_cycles": [3, 4, 5],
+    "survey_ticks": [100, 150],
+    "postures": list(POSTURE_SETS),
+}
+
+
+def postures_for(name: str):
+    from lerobot.motors import Follow
+    from lerobot.robots.so_follower.so_follower import _HARD_STOP_SEARCH_POSTURES
+
+    postures = {joint: list(options) for joint, options in _HARD_STOP_SEARCH_POSTURES.items()}
+    lean = POSTURE_SETS[name] or {}
+    if lean.get("shoulder_lift") == "follow_only":
+        postures["shoulder_lift"] = [
+            p for p in postures["shoulder_lift"] if any(isinstance(v, Follow) for v in p.values())
+        ]
+    if lean.get("elbow_flex") == "wrist_bent_only":
+        postures["elbow_flex"] = [p for p in postures["elbow_flex"] if p]
+    assert all(postures.values())  # every joint keeps at least one posture
+    return postures
+
+
+def scenario(index: int) -> dict:
+    """A servo assembly, a wall and a start pose that touches nothing, all drawn from `index`."""
+    import mujoco
+    import numpy as np
+    from so101sim import JOINTS, SimArm, build_model, random_servos
+
+    rng = np.random.default_rng(10_000 + index)
+    gap = WALL_GAPS[index % len(WALL_GAPS)]
+    model = build_model(wall_gap=gap)
+    servos = random_servos(rng)
+    arm = SimArm(model, servos, record=False)
+    gripper_body = model.body("gripper").id
+    for _ in range(1000):
+        pose = {}
+        for joint in JOINTS:
+            low, high = model.jnt_range[model.joint(joint).id]
+            middle, half = (low + high) / 2, (high - low) / 2
+            pose[joint] = float(middle + rng.uniform(-0.45, 0.45) * half)
+        pose["gripper"] = float(np.radians(rng.uniform(0, 60)))
+        for joint, angle in pose.items():
+            arm.data.qpos[arm.qadr[joint]] = angle
+        mujoco.mj_forward(model, arm.data)
+        if arm.data.ncon == 0 and arm.data.xpos[gripper_body][2] > 0.04:
+            break
+    return {
+        "index": index,
+        "wall_gap": gap,
+        "servos": {j: [s.mount, s.direction] for j, s in servos.items()},
+        "pose": pose,
+    }
+
+
+def run_case(job: tuple[dict, dict]) -> dict:
+    params, case = job
+    import mujoco
+    import numpy as np
+    from so101sim import JOINTS, Servo, SimArm, SimBus, build_model
+
+    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+
+    logging.getLogger("lerobot").setLevel(logging.WARNING)
+    model = build_model(wall_gap=case["wall_gap"])
+    arm = SimArm(model, {j: Servo(m, d) for j, (m, d) in case["servos"].items()}, record=False)
+    arm.trace_every_s = 1e9
+    for joint, angle in case["pose"].items():
+        arm.data.qpos[arm.qadr[joint]] = angle
+    mujoco.mj_forward(model, arm.data)
+
+    config = SO101FollowerConfig(
+        port="/dev/sim",
+        id=f"opt{case['index']}",
+        calibration_dir=Path(tempfile.mkdtemp()),
+        auto_calibrate=True,
+    )
+    config.auto_calibration_torque_limits = list(params["torque_limits"])
+    robot = SO101Follower(config)
+    robot.bus._bus = SimBus(arm, robot.bus._definitions)
+    original = robot.bus.record_calibration_from_hard_stops
+
+    def tuned(*args, **kwargs):
+        kwargs.update(
+            step=params["step"],
+            stall_error=params["stall_error"],
+            stall_cycles=params["stall_cycles"],
+            survey_ticks=params["survey_ticks"],
+            postures=postures_for(params["postures"]),
+        )
+        return original(*args, **kwargs)
+
+    robot.bus.record_calibration_from_hard_stops = tuned
+    error, started = None, time.time()
+    with (
+        patch("lerobot.motors.motors_bus.time.sleep", arm.sleep),
+        patch("builtins.input", lambda prompt="": ""),
+        patch("builtins.print", lambda *a, **k: None),
+    ):
+        try:
+            robot.calibrate()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:200]
+
+    worst, shortfalls = 0.0, {}
+    if error is None:
+        for joint in JOINTS:
+            if joint == "wrist_roll":
+                continue
+            cal = robot.calibration[joint]
+            true_low, true_high = REACHABLE.get(joint, np.degrees(model.jnt_range[model.joint(joint).id]))
+            ends = sorted(
+                np.degrees(arm.angle_of_reading(joint, reading, cal.homing_offset))
+                for reading in (cal.range_min - 20, cal.range_max + 20)
+            )
+            short = (round(ends[0] - true_low, 2), round(true_high - ends[1], 2))
+            shortfalls[joint] = short
+            worst = float(max(worst, *short))
+    return {
+        "case": case["index"],
+        "wall_gap": case["wall_gap"],
+        "error": error,
+        "passed": bool(error is None and worst <= TOLERANCE_DEG),
+        "worst_short_deg": round(worst, 2) if error is None else None,
+        "shortfalls": shortfalls,
+        "sim_s": round(arm.time_s, 1),
+        "wall_s": round(time.time() - started, 1),
+    }
+
+
+class Study:
+    def __init__(self, out: Path, workers: int):
+        self.out, self.workers = out, workers
+        self.state_path = out / "state.json"
+        self.state = (
+            json.loads(self.state_path.read_text())
+            if self.state_path.exists()
+            else {"runs": {}, "scenarios": {}}
+        )
+
+    def save(self) -> None:
+        self.state_path.write_text(json.dumps(self.state))
+
+    def log(self, message: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {message}"
+        print(line, flush=True)
+        with open(self.out / "progress.log", "a") as f:
+            f.write(line + "\n")
+
+    def case(self, index: int) -> dict:
+        key = str(index)
+        if key not in self.state["scenarios"]:
+            self.state["scenarios"][key] = scenario(index)
+            self.save()
+        return self.state["scenarios"][key]
+
+    def evaluate(self, name: str, params: dict, indices: list[int]) -> list[dict]:
+        done = self.state["runs"].setdefault(name, {"params": params, "results": {}})["results"]
+        todo = [i for i in indices if str(i) not in done]
+        if todo:
+            with ProcessPoolExecutor(max_workers=self.workers) as pool:
+                for result in pool.map(run_case, [(params, self.case(i)) for i in todo]):
+                    done[str(result["case"])] = result
+                    self.save()
+                    verdict = "PASS" if result["passed"] else "FAIL"
+                    why = result["error"] or f"worst short {result['worst_short_deg']}°"
+                    self.log(
+                        f"{name}: case {result['case']} wall {result['wall_gap']} {verdict} {result['sim_s']}s sim ({why})"
+                    )
+        results = [done[str(i)] for i in indices]
+        self.leaderboard()
+        return results
+
+    def leaderboard(self) -> None:
+        rows = []
+        for name, run in self.state["runs"].items():
+            results = list(run["results"].values())
+            if not results:
+                continue
+            passed = sum(r["passed"] for r in results)
+            mean_s = sum(r["sim_s"] for r in results) / len(results)
+            rows.append((passed < len(results), mean_s, name, run["params"], passed, len(results)))
+        rows.sort()
+        lines = [
+            "# Auto-calibration settings leaderboard",
+            "",
+            "Pass = every stop found within 3°. Time = simulated seconds per calibration, mean.",
+            "",
+            "| Settings | Passed | Mean time (s) | step | torque ladder | stall lead | stall cycles | survey | postures |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for _, mean_s, name, p, passed, total in rows:
+            lines.append(
+                f"| {name} | {passed}/{total} | {mean_s:.0f} | {p['step']} | {p['torque_limits']} | {p['stall_error']} "
+                f"| {p['stall_cycles']} | {p['survey_ticks']} | {p['postures']} |"
+            )
+        (self.out / "leaderboard.md").write_text("\n".join(lines) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--scenarios", type=int, default=24)
+    parser.add_argument("--candidates", type=int, default=24)
+    parser.add_argument("--workers", type=int, default=2)
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+    study = Study(args.out, args.workers)
+
+    study.log(f"Phase 1: current settings on {args.scenarios} scenarios")
+    baseline = study.evaluate("current", DEFAULTS, list(range(args.scenarios)))
+    failed = [r for r in baseline if not r["passed"]]
+    study.log(f"Phase 1 done: {len(baseline) - len(failed)}/{len(baseline)} passed")
+    if failed:
+        study.log(
+            "Failures to fix before tuning: "
+            + "; ".join(f"case {r['case']}: {r['error'] or r['shortfalls']}" for r in failed)
+        )
+
+    rng = random.Random(0)
+    candidates, seen = {}, {json.dumps(DEFAULTS, sort_keys=True)}
+    while len(candidates) < args.candidates:
+        params = {key: rng.choice(values) for key, values in SPACE.items()}
+        key = json.dumps(params, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            candidates[f"c{len(candidates):02d}"] = params
+
+    # Successive halving: cheap screening first, the fastest survivors on ever more scenarios.
+    rounds = [(4, 8), (12, 3), (args.scenarios, 1)]
+    alive = dict(candidates)
+    for budget, keep in rounds:
+        study.log(f"Phase 2 round: {len(alive)} candidates on {budget} scenarios, keeping {keep}")
+        scored = []
+        for name, params in alive.items():
+            results = study.evaluate(name, params, list(range(budget)))
+            if all(r["passed"] for r in results):
+                scored.append((sum(r["sim_s"] for r in results) / len(results), name))
+            else:
+                study.log(f"{name} out")
+        scored.sort()
+        alive = {name: alive[name] for _, name in scored[:keep]}
+        study.log("Round leaders: " + ", ".join(f"{name} {mean:.0f}s" for mean, name in scored[:keep]))
+        if not alive:
+            break
+    current_mean = sum(r["sim_s"] for r in baseline) / len(baseline)
+    for name, params in alive.items():
+        results = study.state["runs"][name]["results"].values()
+        mean = sum(r["sim_s"] for r in results) / len(results)
+        study.log(
+            f"Best: {name} {params}: {mean:.0f}s mean vs {current_mean:.0f}s now ({100 * (1 - mean / current_mean):.0f}% faster)"
+        )
+    study.log("Done")
+
+
+if __name__ == "__main__":
+    main()
