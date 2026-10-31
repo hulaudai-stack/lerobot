@@ -42,6 +42,20 @@ else:
 # but reports a fault is a different thing, carried by the status error byte.
 _TRANSPORT_ERRORS = (RuntimeError, OSError)
 
+
+# Where an automatic calibration parks a joint's low stop, beyond its margin, before seeking the
+# high stop: near the bottom of the encoder, so the high stop fits whatever pose the joint started in.
+_LOW_STOP_PARKING = 100
+
+
+class EncoderEndError(RuntimeError):
+    """A joint driven towards a stop reached the end of its encoder first, at `position`."""
+
+    def __init__(self, message: str, position: int):
+        super().__init__(message)
+        self.position = position
+
+
 type NameOrID = str | int
 type Value = int | float
 
@@ -1098,8 +1112,9 @@ class SerialMotorsBus(MotorsBusBase):
                 goal += direction * step
                 if not 0 <= goal <= max_position:
                     self.write("Goal_Position", motor, position, normalize=False)
-                    raise RuntimeError(
-                        f"Motor '{motor}' found no hard stop before the end of its encoder at {position}."
+                    raise EncoderEndError(
+                        f"Motor '{motor}' found no hard stop before the end of its encoder at {position}.",
+                        position,
                     )
                 self.write("Goal_Position", motor, goal, normalize=False)
             time.sleep(period_s)
@@ -1142,6 +1157,37 @@ class SerialMotorsBus(MotorsBusBase):
         assert furthest is not None
         return furthest, len(limits) == 1
 
+    def _shift_homing(self, motor: str, delta: int) -> int:
+        """Rewrite the homing offset of a torque-enabled `motor` so that it reads `delta` more,
+        modulo its encoder, without moving: its torque is off only while the offset is written,
+        which a motor's EEPROM needs, and its goal follows the new reading.
+
+        Returns:
+            `int`: The shift applied: `delta`, or a step off when a sign-magnitude offset is
+            clamped, as in [`~SerialMotorsBus._get_half_turn_homings`].
+        """
+        definition = self._definition(motor)
+        sign, register = definition.homing_offset_sign, definition.register("homing_offset")
+        if sign is None or register is None:
+            raise ValueError(f"Motor {motor!r} does not support homing offsets")
+        resolution = self.resolution(self.motors[motor].model)
+        current = int(self.read("Homing_Offset", motor, normalize=False))
+        # Offsets a whole turn apart read the same, so the one nearest zero is written.
+        offset = (current + sign * delta + resolution // 2) % resolution - resolution // 2
+        if (sign_bit := register.sign_bit) is not None:
+            max_magnitude = (1 << sign_bit) - 1
+            offset = max(-max_magnitude, min(max_magnitude, offset))
+        applied = (sign * (offset - current) + resolution // 2) % resolution - resolution // 2
+
+        self.disable_torque(motor)
+        try:
+            self.write("Homing_Offset", motor, offset, normalize=False)
+            position = self.read("Present_Position", motor, normalize=False)
+            self.write("Goal_Position", motor, position, normalize=False)
+        finally:
+            self.enable_torque(motor)
+        return applied
+
     def record_calibration_from_hard_stops(
         self,
         mode: str,
@@ -1161,9 +1207,13 @@ class SerialMotorsBus(MotorsBusBase):
         """Calibrate motors by driving each joint into its two hard stops, instead of by hand.
 
         The motors are prepared as in [`~SerialMotorsBus.record_calibration`], then the pose
-        they are in becomes a half turn of each motor: it must be within half a turn of every
-        stop, so that no joint wraps around its encoder. Every motor is then held in place and
-        the motors not full-turn are searched one at a time, in the order of `motors`.
+        they are in becomes a half turn of each motor. Every motor is then held in place and the
+        motors not full-turn are searched one at a time, in the order of `motors`, the low stop
+        first. A joint that runs out of encoder before its low stop is re-homed to the middle of
+        its encoder and pushed on, and its low stop is then re-homed near the bottom of the
+        encoder, so that its high stop fits too: any joint whose stops are less than a turn apart
+        is searched, whatever pose it started in. Once both stops are found, the joint is re-homed
+        so that the middle of its range is a half turn, as a manual calibration makes it.
 
         A joint is searched in both directions, once per posture of the joints searched before
         it (`postures`), and its range spans the furthest stops found over all of them: an
@@ -1234,18 +1284,39 @@ class SerialMotorsBus(MotorsBusBase):
         range_maxes: dict[str, int] = {}
         unconfirmed: list[str] = []
 
-        def seek(motor: str, direction: int) -> int:
-            return self.find_hard_stop(
-                motor,
-                direction,
-                step=step,
-                stall_error=stall_error,
-                stall_cycles=stall_cycles,
-                period_s=period_s,
-            )
+        # Positions are tracked in each motor's frame at the start, as the homing of a motor may
+        # shift while it is searched: what it reads is that position plus `shifts[motor]`.
+        shifts = dict.fromkeys(motor_names, 0)
+        middles = {motor: (self.resolution(self.motors[motor].model) - 1) // 2 for motor in motor_names}
 
-        def move(motor: str, target: int) -> None:
-            self.move_to_position(motor, target, step=step, period_s=period_s)
+        def rehome(motor: str, position: int, reading: int) -> None:
+            """Shift the homing of `motor` so that `position` reads `reading`."""
+            if delta := reading - (position + shifts[motor]):
+                shifts[motor] += self._shift_homing(motor, delta)
+
+        def seek(motor: str, direction: int) -> int:
+            # Towards its low stop, a joint that runs out of encoder is re-homed to the middle of
+            # its encoder and pushed on: its start need not be within half a turn of that stop.
+            # Towards its high stop, its low stop is parked at the bottom of the encoder already.
+            for _ in range(2):
+                try:
+                    reached = self.find_hard_stop(
+                        motor,
+                        direction,
+                        step=step,
+                        stall_error=stall_error,
+                        stall_cycles=stall_cycles,
+                        period_s=period_s,
+                    )
+                    return reached - shifts[motor]
+                except EncoderEndError as end:
+                    if direction == 1:
+                        raise
+                    rehome(motor, end.position - shifts[motor], middles[motor])
+            raise RuntimeError(f"Motor '{motor}' found no hard stop within a turn.")
+
+        def move(motor: str, position: int) -> None:
+            self.move_to_position(motor, position + shifts[motor], step=step, period_s=period_s)
 
         try:
             # Hold every joint where it is, so the arm does not sag while one is searched.
@@ -1261,15 +1332,18 @@ class SerialMotorsBus(MotorsBusBase):
                 for posture in postures.get(motor) or [{}]:
                     for other, fraction in posture.items():
                         low, high = range_mins[other], range_maxes[other]
-                        move(other, round(low + fraction * (high - low)))
+                        move(other, round(low + fraction * (high - low)) - shifts[other])
                     for direction in (-1, 1):
                         stop, confirmed = self._seek_confirmed_stop(
                             motor, direction, torque_limits, confirm_tolerance, seek
                         )
-                        move(motor, starts[motor])
                         best = stops.get(direction)
                         if best is None or direction * (stop - best[0]) > 0:
                             stops[direction] = (stop, confirmed)
+                        if direction == -1:
+                            # The low stop at the bottom of the encoder leaves the high stop room.
+                            rehome(motor, stops[-1][0], margin + _LOW_STOP_PARKING)
+                        move(motor, starts[motor])
                     for other in posture:
                         move(other, starts[other])
                     logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")
@@ -1279,13 +1353,19 @@ class SerialMotorsBus(MotorsBusBase):
                     raise RuntimeError(
                         f"Motor '{motor}' moved only {high - low} ticks between its stops: is it blocked?"
                     )
-                range_mins[motor], range_maxes[motor] = low + margin, high - margin
+                # Like a manual calibration, the middle of the range is a half turn.
+                rehome(motor, (low + high) // 2, middles[motor])
+                homing_offsets[motor] = int(self.read("Homing_Offset", motor, normalize=False))
+                range_mins[motor] = low + shifts[motor] + margin
+                range_maxes[motor] = high + shifts[motor] - margin
                 unconfirmed += [
                     f"{motor} {end}"
                     for end, ok in (("low", low_confirmed), ("high", high_confirmed))
                     if not ok
                 ]
-                logger.info(f"{motor}: hard stops at {low} and {high}")
+                logger.info(
+                    f"{motor}: hard stops at {range_mins[motor] - margin} and {range_maxes[motor] + margin}"
+                )
         finally:
             self.disable_torque(motor_names)
 
