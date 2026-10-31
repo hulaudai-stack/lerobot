@@ -23,7 +23,7 @@ from lerobot.robots.so_follower import (
     SO100Follower,
     SO100FollowerConfig,
 )
-from lerobot.robots.so_follower.so_follower import _HARD_STOP_SEARCH_POSTURES
+from lerobot.robots.so_follower.so_follower import _HARD_STOP_REVISITS, _HARD_STOP_SEARCH_POSTURES
 
 
 def _make_bus_mock() -> MagicMock:
@@ -162,6 +162,7 @@ def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
         motors=["gripper", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan", "wrist_roll"],
         torque_limits=[150, 300],
         postures=_HARD_STOP_SEARCH_POSTURES,
+        revisit=_HARD_STOP_REVISITS,
     )
     follower.bus.write_calibration.assert_called_once_with({})
 

@@ -5,8 +5,10 @@ Runs unattended and can be resumed: everything is saved under OUT_DIR as it goes
     python optimize.py OUT_DIR [--scenarios 24] [--candidates 24] [--workers 2]
 
 Phase 1, robustness: the current settings against scenarios that each draw a servo assembly
-(mounting angle and direction of every encoder), a start pose anywhere within the middle ~45% of
-each joint's range, and a wall 3.5 cm to 20 cm behind the base, or none.
+(mounting angle and direction of every encoder), a start pose, and a wall 3.5 cm to 20 cm behind
+the base, or none. The start pose is roughly the middle pose, as a person places the arm (within
+20 degrees of it per joint, 30 for the pan), or with START_SPREAD=stress, anywhere within ~45% of
+each joint's range.
 
 Phase 2, optimisation: random settings (ramp speed, torque ladder, stall detection, survey size,
 postures searched) by successive halving. A candidate that misses a single stop by more than
@@ -77,6 +79,15 @@ def postures_for(name: str):
     return postures
 
 
+# How far from the middle pose a scenario's start may be, in degrees per joint: "roughly the middle
+# pose", as a person places the arm following the instructions, or a stress test far beyond that.
+START_SPREADS = {
+    "middle": {"shoulder_pan": 30, "shoulder_lift": 20, "elbow_flex": 20, "wrist_flex": 20, "wrist_roll": 60},
+    "stress": {"shoulder_pan": 50, "shoulder_lift": 45, "elbow_flex": 43, "wrist_flex": 43, "wrist_roll": 70},
+}
+SPREAD = os.environ.get("START_SPREAD", "middle")
+
+
 def scenario(index: int) -> dict:
     """A servo assembly, a wall and a start pose that touches nothing, all drawn from `index`."""
     import mujoco
@@ -92,9 +103,10 @@ def scenario(index: int) -> dict:
     for _ in range(1000):
         pose = {}
         for joint in JOINTS:
-            low, high = model.jnt_range[model.joint(joint).id]
-            middle, half = (low + high) / 2, (high - low) / 2
-            pose[joint] = float(middle + rng.uniform(-0.45, 0.45) * half)
+            if joint == "gripper":
+                continue
+            spread = START_SPREADS[SPREAD][joint]
+            pose[joint] = float(np.radians(rng.uniform(-spread, spread)))
         pose["gripper"] = float(np.radians(rng.uniform(0, 60)))
         for joint, angle in pose.items():
             arm.data.qpos[arm.qadr[joint]] = angle
@@ -109,7 +121,7 @@ def scenario(index: int) -> dict:
     }
 
 
-def run_case(job: tuple[dict, dict]) -> dict:
+def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
     params, case = job
     import mujoco
     import numpy as np
@@ -119,7 +131,12 @@ def run_case(job: tuple[dict, dict]) -> dict:
 
     logging.getLogger("lerobot").setLevel(logging.WARNING)
     model = build_model(wall_gap=case["wall_gap"])
-    arm = SimArm(model, {j: Servo(m, d) for j, (m, d) in case["servos"].items()}, record=False)
+    arm = SimArm(
+        model,
+        {j: Servo(m, d) for j, (m, d) in case["servos"].items()},
+        record=video is not None,
+        frame_every_s=0.25,
+    )
     arm.trace_every_s = 1e9
     for joint, angle in case["pose"].items():
         arm.data.qpos[arm.qadr[joint]] = angle
@@ -147,6 +164,13 @@ def run_case(job: tuple[dict, dict]) -> dict:
         return original(*args, **kwargs)
 
     robot.bus.record_calibration_from_hard_stops = tuned
+    handler = None
+    if video is not None:
+        from so101sim import CaptionHandler
+
+        handler = CaptionHandler(arm)
+        logging.getLogger("lerobot.motors.motors_bus").addHandler(handler)
+        logging.getLogger("lerobot.motors.motors_bus").setLevel(logging.INFO)
     error, started = None, time.time()
     with (
         patch("lerobot.motors.motors_bus.time.sleep", arm.sleep),
@@ -158,6 +182,11 @@ def run_case(job: tuple[dict, dict]) -> dict:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:200]
 
+    if video is not None:
+        from so101sim import write_video
+
+        write_video(arm.frames, video)
+        video.with_suffix(".log").write_text("\n".join(handler.lines))
     worst, shortfalls = 0.0, {}
     if error is None:
         for joint in JOINTS:
@@ -259,9 +288,15 @@ def main() -> None:
     parser.add_argument("--scenarios", type=int, default=24)
     parser.add_argument("--candidates", type=int, default=24)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--replay", type=int, nargs="*", help="scenarios to replay on video, then exit")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     study = Study(args.out, args.workers)
+    if args.replay is not None:
+        for index in args.replay:
+            result = run_case((DEFAULTS, study.case(index)), video=args.out / f"case{index}.mp4")
+            print(json.dumps(result))
+        return
 
     study.log(f"Phase 1: current settings on {args.scenarios} scenarios")
     baseline = study.evaluate("current", DEFAULTS, list(range(args.scenarios)))

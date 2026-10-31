@@ -1303,6 +1303,7 @@ class SerialMotorsBus(MotorsBusBase):
         *,
         torque_limits: Sequence[int] = (),
         postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
+        revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
         confirm_tolerance: int = 15,
         return_tolerance: int = 80,
         survey_ticks: int = 150,
@@ -1358,6 +1359,11 @@ class SerialMotorsBus(MotorsBusBase):
                 [`Raised`] against gravity, or makes them [`Follow`] it as it turns; the others
                 stay where they started. A motor without postures is searched once, as the
                 joints started.
+            revisit (`Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]]`, *optional*):
+                Motors searched again once every motor has been, from these postures, which may
+                place any motor searched: a stop that depends on a joint calibrated later, as the
+                elbow folding as far as the shoulder's tilt allows. Each range spans the furthest
+                stops of every visit.
             confirm_tolerance (`int`, *optional*, defaults to `15`):
                 Ticks a stronger push may gain over the last one and still confirm the stop.
             return_tolerance (`int`, *optional*, defaults to `80`):
@@ -1404,12 +1410,21 @@ class SerialMotorsBus(MotorsBusBase):
                 ]:
                     raise ValueError(f"Postures of '{motor}' place {outside} outside their range.")
 
+        revisit = revisit or {}
+        for motor, motor_postures in revisit.items():
+            if motor not in searched:
+                raise ValueError(f"'{motor}' is revisited but not searched.")
+            for posture in motor_postures:
+                if misplaced := [other for other in posture if other not in searched or other == motor]:
+                    raise ValueError(
+                        f"Revisit postures of '{motor}' place {misplaced}, not other motors searched."
+                    )
+
         drive_modes = self._prepare_calibration(mode, motor_names, inverted_motors)
         homing_offsets = self.set_half_turn_homings(motor_names)
 
         range_mins: dict[str, int] = {}
         range_maxes: dict[str, int] = {}
-        unconfirmed: list[str] = []
 
         # Positions are tracked in each motor's frame at the start, as the homing of a motor may
         # shift while it is searched: what it reads is that position plus `shifts[motor]`.
@@ -1509,9 +1524,33 @@ class SerialMotorsBus(MotorsBusBase):
                 for motor in searched
             }
 
-            for motor in searched:
+            # Each joint in turn, then the ones revisited, in postures of joints calibrated since.
+            schedule = [(motor, postures.get(motor) or [{}]) for motor in searched] + list(revisit.items())
+            found: dict[str, dict[int, tuple[int, bool]]] = {}
+            for motor, motor_postures in schedule:
                 stops.clear()
-                for posture in self._resolve_raised(postures.get(motor) or [{}], gravity):
+                stops.update(found.get(motor, {}))
+                # A joint to raise whose survey found no pull, as one standing near upright when the
+                # arm started, is surveyed again in the posture, from the middle of its range.
+                for posture in motor_postures:
+                    unknown = [
+                        o for o, place in posture.items() if isinstance(place, Raised) and not gravity.get(o)
+                    ]
+                    if not unknown:
+                        continue
+                    placed = [o for o, place in posture.items() if not isinstance(place, (Follow, Raised))]
+                    for other in placed:
+                        low, high = range_mins[other], range_maxes[other]
+                        move(other, round(low + posture[other] * (high - low)) - shifts[other])
+                    for other in unknown:
+                        move(other, (range_mins[other] + range_maxes[other]) // 2 - shifts[other])
+                        gravity[other] = self._survey_gravity(
+                            other, survey_ticks, gravity_threshold, move_raw
+                        )
+                        move(other, starts[other])
+                    for other in placed:
+                        move(other, starts[other])
+                for posture in self._resolve_raised(motor_postures, gravity):
                     for other, place in posture.items():
                         if not isinstance(place, (Follow, Raised)):
                             low, high = range_mins[other], range_maxes[other]
@@ -1546,7 +1585,8 @@ class SerialMotorsBus(MotorsBusBase):
                         move(other, starts[other])
                     logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")
 
-                (low, low_confirmed), (high, high_confirmed) = stops[-1], stops[1]
+                found[motor] = dict(stops)
+                (low, _), (high, _) = stops[-1], stops[1]
                 if high - low <= 2 * margin:
                     raise RuntimeError(
                         f"Motor '{motor}' moved only {high - low} ticks between its stops: is it blocked?"
@@ -1556,17 +1596,18 @@ class SerialMotorsBus(MotorsBusBase):
                 homing_offsets[motor] = int(self.read("Homing_Offset", motor, normalize=False))
                 range_mins[motor] = low + shifts[motor] + margin
                 range_maxes[motor] = high + shifts[motor] - margin
-                unconfirmed += [
-                    f"{motor} {end}"
-                    for end, ok in (("low", low_confirmed), ("high", high_confirmed))
-                    if not ok
-                ]
                 logger.info(
                     f"{motor}: hard stops at {range_mins[motor] - margin} and {range_maxes[motor] + margin}"
                 )
         finally:
             self.disable_torque(motor_names)
 
+        unconfirmed = [
+            f"{motor} {'low' if direction < 0 else 'high'}"
+            for motor, motor_stops in found.items()
+            for direction, (_, confirmed) in sorted(motor_stops.items())
+            if not confirmed
+        ]
         if unconfirmed:
             logger.warning(
                 f"These stops were still moving at the strongest push, so the ranges may be short: {unconfirmed}."

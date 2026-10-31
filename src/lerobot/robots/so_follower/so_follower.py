@@ -44,8 +44,8 @@ _HARD_STOP_SEARCH_ORDER = [
 # onto the upper arm. While the shoulder tips forward and back, the wrist is bent upward, as the survey of the
 # joints found gravity pulling it, and the elbow turns against the shoulder to keep the hand up: whichever way
 # the servos are mounted, one of its two directions keeps the forearm level, and the other only meets the table
-# sooner, at a reduced torque. The shoulder pans with the forearm raised and the wrist straight, the arm a
-# column over the base, so the hand does not sweep into a wall behind it.
+# sooner, at a reduced torque. The shoulder pans with the upper arm upright, the forearm raised and the wrist
+# straight, the arm a column over the base, so the hand sweeps into neither a wall behind it nor the table.
 _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
     "elbow_flex": [{}, {"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
     "shoulder_lift": [
@@ -53,7 +53,14 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] 
         {"wrist_flex": Raised(), "elbow_flex": Follow(1.0)},
         {"wrist_flex": Raised(), "elbow_flex": Follow(-1.0)},
     ],
-    "shoulder_pan": [{"elbow_flex": Raised(), "wrist_flex": 0.5}],
+    "shoulder_pan": [{"shoulder_lift": 0.5, "elbow_flex": Raised(), "wrist_flex": 0.5}],
+}
+# Joints searched again at the end. The elbow folds fully only with the wrist bent inward, and with the upper arm
+# upright: tilted back, the folding hand meets a wall behind the arm. The shoulder's tilt is only known once it is
+# calibrated, so the elbow folds once more with the upper arm upright and the wrist bent each way, as which way is
+# inward depends on how its servo is mounted.
+_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised]]] = {
+    "elbow_flex": [{"shoulder_lift": 0.5, "wrist_flex": 0.15}, {"shoulder_lift": 0.5, "wrist_flex": 0.85}],
 }
 
 _HOMING_POSITION_DIAGRAM = r"""
@@ -186,6 +193,7 @@ class SOFollower(Robot):
             motors=_HARD_STOP_SEARCH_ORDER,
             torque_limits=self.config.auto_calibration_torque_limits,
             postures=_HARD_STOP_SEARCH_POSTURES,
+            revisit=_HARD_STOP_REVISITS,
         )
 
     def configure(self) -> None:
