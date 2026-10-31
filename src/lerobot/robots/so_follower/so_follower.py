@@ -47,11 +47,13 @@ _HARD_STOP_SEARCH_ORDER = [
 # sooner, at a reduced torque. The shoulder pans with the upper arm upright, the forearm raised and the wrist
 # straight, the arm a column over the base, so the hand sweeps into neither a wall behind it nor the table.
 _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
-    "elbow_flex": [{}, {"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
-    "shoulder_lift": [
-        {},
-        {"wrist_flex": Raised(), "elbow_flex": Follow(1.0)},
-        {"wrist_flex": Raised(), "elbow_flex": Follow(-1.0)},
+    "elbow_flex": [{"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
+    "shoulder_lift": [{"wrist_flex": Raised(), "elbow_flex": Follow(ratio)} for ratio in (1.0, -1.0)]
+    + [
+        # From a forearm lifted 20 degrees, the hand clears the table sooner when the shoulder tips forward;
+        # level, it clears a wall sooner when the shoulder tips back.
+        {"wrist_flex": Raised(), "elbow_flex": Follow(ratio, lift=230)}
+        for ratio in (1.0, -1.0)
     ],
     "shoulder_pan": [{"shoulder_lift": 0.5, "elbow_flex": Raised(), "wrist_flex": 0.5}],
 }
@@ -194,6 +196,7 @@ class SOFollower(Robot):
             torque_limits=self.config.auto_calibration_torque_limits,
             postures=_HARD_STOP_SEARCH_POSTURES,
             revisit=_HARD_STOP_REVISITS,
+            lift={"elbow_flex": 230},
         )
 
     def configure(self) -> None:

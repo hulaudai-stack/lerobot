@@ -48,9 +48,12 @@ class Follow:
     """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor that
     follows the one searched: it turns `ratio` ticks for each tick the searched one has turned
     from where it started, within its own range. A ratio of 1 or -1 makes a joint cancel the turn of
-    the one searched, e.g. an elbow keeping the forearm level while the shoulder tips."""
+    the one searched, e.g. an elbow keeping the forearm level while the shoulder tips. With
+    `lift`, it first turns that many ticks against gravity, as the survey found it, and follows
+    from there."""
 
     ratio: float
+    lift: int = 0
 
 
 @dataclass(frozen=True)
@@ -1304,15 +1307,16 @@ class SerialMotorsBus(MotorsBusBase):
         torque_limits: Sequence[int] = (),
         postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
         revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
+        lift: Mapping[str, int] | None = None,
         confirm_tolerance: int = 15,
         return_tolerance: int = 80,
-        survey_ticks: int = 150,
+        survey_ticks: int = 100,
         gravity_threshold: int = 4,
         margin: int = 20,
         step: int = 8,
         move_step: int | None = None,
-        stall_error: int = 200,
-        stall_cycles: int = 5,
+        stall_error: int = 150,
+        stall_cycles: int = 3,
         guard: int = 150,
         period_s: float = 0.02,
     ) -> dict[str, MotorCalibration]:
@@ -1365,12 +1369,18 @@ class SerialMotorsBus(MotorsBusBase):
                 place any motor searched: a stop that depends on a joint calibrated later, as the
                 elbow folding as far as the shoulder's tilt allows. Each range spans the furthest
                 stops of every visit.
+            lift (`Mapping[str, int]`, *optional*):
+                Ticks each of these motors turns against gravity, as the survey found it, before
+                any stop is sought, and holds until its own search, after which it goes back to
+                where it started: an elbow lifting a hand that started low, clear of the table the
+                first searches could press it into. A motor the survey found no pull on stays
+                where it is.
             confirm_tolerance (`int`, *optional*, defaults to `15`):
                 Ticks a stronger push may gain over the last one and still confirm the stop.
             return_tolerance (`int`, *optional*, defaults to `80`):
                 Ticks a joint going back to where it started, or to a posture, may settle away
                 from it: a joint holding a load sags short of its goal.
-            survey_ticks (`int`, *optional*, defaults to `150`):
+            survey_ticks (`int`, *optional*, defaults to `100`):
                 Before any stop is sought, each joint searched is turned this far each way from
                 its start and back, at its own torque: where it settles tells the way gravity
                 pulls it, as it sags short of its goal on that side. 0 skips the survey.
@@ -1532,6 +1542,17 @@ class SerialMotorsBus(MotorsBusBase):
                 for motor in searched
             }
 
+            # Lift: links turned up a little, away from the table, for the searches before their own.
+            lifted_from: dict[str, int] = {}
+            for motor, ticks in (lift or {}).items():
+                if gravity.get(motor):
+                    lifted_from[motor] = starts[motor]
+                    try:
+                        move(motor, starts[motor] - gravity[motor] * ticks)
+                    except RuntimeError:
+                        logger.info(f"{motor}: could not lift {ticks} ticks")
+                    starts[motor] = int(self.read("Present_Position", motor, normalize=False)) - shifts[motor]
+
             # Each joint in turn, then the ones revisited, in postures of joints calibrated since.
             schedule = [(motor, postures.get(motor) or [{}]) for motor in searched] + list(revisit.items())
             found: dict[str, dict[int, tuple[int, bool]]] = {}
@@ -1566,6 +1587,9 @@ class SerialMotorsBus(MotorsBusBase):
                             low, high = range_mins[other], range_maxes[other]
                             move(other, round(low + place * (high - low)) - shifts[other])
                     follow_state["turned"] = 0
+                    for other, place in posture.items():
+                        if isinstance(place, Follow) and place.lift and gravity.get(other):
+                            move(other, starts[other] - gravity[other] * place.lift)
                     followers.update(
                         {
                             other: (
@@ -1596,6 +1620,10 @@ class SerialMotorsBus(MotorsBusBase):
                     logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")
 
                 found[motor] = dict(stops)
+                if motor in lifted_from:
+                    # Searched now: back down to where it started, for the searches after its own.
+                    starts[motor] = lifted_from.pop(motor)
+                    move(motor, starts[motor])
                 (low, _), (high, _) = stops[-1], stops[1]
                 if high - low <= 2 * margin:
                     raise RuntimeError(

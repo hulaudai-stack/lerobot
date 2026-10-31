@@ -48,10 +48,10 @@ POSTURE_SETS = {
 DEFAULTS = {
     "step": 8,
     "move_step": 8,
-    "torque_limits": [150, 300, 500],
-    "stall_error": 200,
-    "stall_cycles": 5,
-    "survey_ticks": 150,
+    "torque_limits": [150, 500],
+    "stall_error": 150,
+    "stall_cycles": 3,
+    "survey_ticks": 100,
     "postures": "default",
 }
 SPACE = {
@@ -142,6 +142,7 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
         frame_every_s=0.25,
     )
     arm.trace_every_s = 1e9
+    arm.noise_ticks = int(os.environ.get("NOISE_TICKS", "0"))
     for joint, angle in case["pose"].items():
         arm.data.qpos[arm.qadr[joint]] = angle
     mujoco.mj_forward(model, arm.data)

@@ -60,9 +60,20 @@ Every result below is from LeRobot's own calibration code driving the simulated 
 | Revisit the elbow with the upper arm upright and the wrist bent each way | Elbow fold 4–5° short when the shoulder started tilted back | Within 1° |
 | Re-survey a joint whose start-pose survey was unclear | Wrong "up" for the elbow: hand dragged along the table | Correct |
 
-From a start roughly in the middle pose (within 20° per joint, 30° for the pan), with a random servo assembly and a wall 3.5 cm to 20 cm behind the base or none: **48 of 48** scenarios find every stop within 3°.
+From a start roughly in the middle pose (within 20° per joint, 30° for the pan), with a random servo assembly and a wall 3.5 cm to 20 cm behind the base or none:
+
+| Scenarios | Encoder noise | Every stop within 3° |
+|---|---|---|
+| 0–47, used while developing | none | 48 / 48 |
+| 48–95, fresh | ±1 tick | 48 / 48 |
+| 96–143, held out until the end | ±1 tick | 47 / 48 |
+
+That is 143 of 144. A calibration takes about 3 minutes of arm time.
+
+The optimiser (`optimize.py`) then tuned the settings LeRobot ships: a torque ladder of 15% then 50%, a stall after 3 still periods, 100-tick survey moves, and the leaner postures. They cut the time by 26% at the same pass rate. Two more postures for the shoulder, from the elbow lifted 20°, then gave back some of that for the last scenarios. A brief lift of the elbow against gravity, before the first searches, keeps a hand that starts low off the table.
 
 ### Limits
 
-- **Start far from the middle pose.** Started further away (up to ~45% of each joint's range), about 40% of runs fail, mostly a hand that starts close to the table getting wedged against it. Recovering would mean dropping torque on a loaded joint, which on a real arm drops the shoulder, so the calibration asks to start in the middle pose.
+- **Start far from the middle pose.** Started anywhere within ~45% of each joint's range, 30 of 48 runs pass. Most failures are a hand that starts close to the table getting wedged against it. Recovering would mean dropping torque on a loaded joint, which on a real arm drops the shoulder, so the calibration asks to start in the middle pose.
+- **One wedge in 144.** In the held-out scenario that fails, the survey cannot tell which way gravity pulls the elbow, so the hand is not lifted, and the first wrist search presses it into the table.
 - **Speed.** Ramping faster than 8 ticks per 20 ms fails even for moves back through space already swept: a hand starting near the table swings into it and wedges. The same holds for a first push above 15% torque. The optimiser therefore only tunes stall detection, survey size, the torque ladder and the postures.

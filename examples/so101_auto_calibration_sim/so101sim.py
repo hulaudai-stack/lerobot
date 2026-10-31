@@ -129,6 +129,7 @@ class SimArm:
     width: int = 480
     height: int = 360
     record: bool = True
+    noise_ticks: int = 0  # each reading off by up to this many ticks, as a real encoder jitters
     data: mujoco.MjData = field(init=False)
     bus: MockBus | None = field(default=None, init=False)
     time_s: float = field(default=0.0, init=False)
@@ -257,6 +258,7 @@ class SimBus(MockBus):
     def __init__(self, arm: SimArm, motors):
         super().__init__(motors=motors)
         self.arm = arm
+        self.rng = np.random.default_rng(0)
         arm.bus = self
         for joint, id_ in IDS.items():
             self.seed(id_, "model_number", 777)
@@ -266,8 +268,10 @@ class SimBus(MockBus):
             self.seed(id_, "goal_position", round(arm.present(joint)))
 
     def _refresh(self) -> None:
+        jitter = self.arm.noise_ticks
         for joint, id_ in IDS.items():
-            self.seed(id_, "present_position", int(round(self.arm.present(joint))) % TICKS)
+            noise = int(self.rng.integers(-jitter, jitter + 1)) if jitter else 0
+            self.seed(id_, "present_position", (int(round(self.arm.present(joint))) + noise) % TICKS)
 
     def read_register_with_error(self, motor_id, register, retries=0):
         self._refresh()
