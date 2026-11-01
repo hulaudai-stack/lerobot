@@ -151,6 +151,16 @@ class SimArm:
         # than STRESS_PCT of its maximum, the time spent pushing hard rather than holding the arm.
         self._peak = np.zeros(len(JOINTS))
         self._hard = np.zeros(len(JOINTS))
+        # The hardest the arm pressed on the table, the wall or a clamp, in newtons, and on
+        # what: a calibration that presses there could break a printed part.
+        self.peak_contact_n = 0.0
+        self.peak_contact_on = ""
+        self._environment = {
+            self.model.geom(name).id
+            for name in ("table", "wall", "clamp_left", "clamp_right")
+            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) >= 0
+        }
+        self._force = np.zeros(6)
         self.joint_ids = {name: self.model.joint(name).id for name in JOINTS}
         self.actuator_ids = {name: self.model.actuator(name).id for name in JOINTS}
         self.qadr = {name: self.model.jnt_qposadr[self.joint_ids[name]] for name in JOINTS}
@@ -225,6 +235,14 @@ class SimArm:
             torque = np.abs(self.data.actuator_force[self._actuators])
             np.maximum(self._peak, torque, out=self._peak)
             self._hard += (torque > STRESS_PCT / 100 * MAX_TORQUE_NM) * self.model.opt.timestep
+            for i in range(self.data.ncon):
+                contact = self.data.contact[i]
+                if contact.geom1 in self._environment or contact.geom2 in self._environment:
+                    mujoco.mj_contactForce(self.model, self.data, i, self._force)
+                    if self._force[0] > self.peak_contact_n:
+                        self.peak_contact_n = float(self._force[0])
+                        env = contact.geom1 if contact.geom1 in self._environment else contact.geom2
+                        self.peak_contact_on = self.model.geom(env).name
             if not self.trace or self.time_s - self.trace[-1][0] >= self.trace_every_s:
                 self.trace.append(
                     (

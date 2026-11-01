@@ -59,6 +59,11 @@ Every result below is from LeRobot's own calibration code driving the simulated 
 | Followers track the joint's position through a ratchet, not its goal | Elbow wedged the hand into the table behind (4 of 8 at 20 cm) | 5 of 5 |
 | Revisit the elbow with the upper arm upright and the wrist bent each way | Elbow fold 4–5° short when the shoulder started tilted back | Within 1° |
 | Re-survey a joint whose start-pose survey was unclear | Wrong "up" for the elbow: hand dragged along the table | Correct |
+| Read gravity from the sag of a held joint before turning it | A hand resting on the table hid the pull | Correct |
+| Tip the shoulder back with the wrist straight, not bent up | 3.5 cm wall: hand curled into it, shoulder 23° short | Full range |
+| Let go of a joint shoved by another's push before that one turns back | Shoved shoulder sprang back and wedged the hand into the wall at 100% torque | No wedge |
+| Cap moves at 45% torque, full torque only if blocked | Return moves pressed the hand into the wall at up to 33 N | ≤ 23 N, 5.5 N mean |
+| Raise only the forearm at the start; flip a raise blocked at once | Raising the shoulder "upright" leant the arm back into the wall | Correct |
 
 From a start roughly in the middle pose (within 20° per joint, 30° for the pan), with a random servo assembly and a wall 3.5 cm to 20 cm behind the base or none:
 
@@ -68,12 +73,18 @@ From a start roughly in the middle pose (within 20° per joint, 30° for the pan
 | 48–95, fresh | ±1 tick | 48 / 48 |
 | 96–143, held out until the end | ±1 tick | 47 / 48 |
 
-That is 143 of 144. A calibration takes about 3 minutes of arm time.
+That is 143 of 144. With the changes below the table, every scenario passes:
 
-The optimiser (`optimize.py`) then tuned the settings LeRobot ships: a torque ladder of 15% then 50%, a stall after 3 still periods, 100-tick survey moves, and the leaner postures. They cut the time by 26% at the same pass rate. Two more postures for the shoulder, from the elbow lifted 20°, then gave back some of that for the last scenarios. A brief lift of the elbow against gravity, before the first searches, keeps a hand that starts low off the table.
+| Scenarios | Pass | Peak torque, mean / max | Env. contact, mean / max | Steps | Arm time |
+|---|---|---|---|---|---|
+| 744–1343, before | 599 / 600 | 60% / 100% | 7.2 N / 21 N | 27 pushes + 69 moves | 174 s |
+| 90 hardest (all past failures, highest forces, 0–47) | 90 / 90 | 42% / 47% | 5.5 N / 19.5 N | 24 pushes + 71 moves | 140 s |
+| 1344–1943, fresh | **600 / 600** | 42% / 47% | 5.5 N / 22.8 N | 24 pushes + 72 moves | 141 s |
+
+The settings LeRobot ships were chosen by comparing variants on the 90 hardest scenarios with `optimize.py`: a torque ladder of 15% then 30%, two shoulder postures instead of four, moves capped at 45%. A single push at 30% (`--robot.auto_calibration_torque_limits=[300]`) saves another 6 pushes and 7 s at the same forces (599 of 600, before the fix of the one failure, a hand resting on the table), but presses every stop at 30% and has no stronger push to tell a stop from a joint too weak to move on.
 
 ### Limits
 
 - **Start far from the middle pose.** Started anywhere within ~45% of each joint's range, 30 of 48 runs pass. Most failures are a hand that starts close to the table getting wedged against it. Recovering would mean dropping torque on a loaded joint, which on a real arm drops the shoulder, so the calibration asks to start in the middle pose.
-- **One wedge in 144.** In the held-out scenario that fails, the survey cannot tell which way gravity pulls the elbow, so the hand is not lifted, and the first wrist search presses it into the table.
+- **Contact.** Every run touches the table or the wall: a stop the arm cannot reach without touching either is reached by pressing on it, at a reduced torque. About one run in six presses on it with more than 10 N, briefly.
 - **Speed.** Ramping faster than 8 ticks per 20 ms fails even for moves back through space already swept: a hand starting near the table swings into it and wedges. The same holds for a first push above 15% torque. The optimiser therefore only tunes stall detection, survey size, the torque ladder and the postures.

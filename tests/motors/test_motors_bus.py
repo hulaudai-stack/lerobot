@@ -552,7 +552,7 @@ class _Joints:
         stops: dict[int, _Stops],
         start: int = 2047,
         speed: int = 10_000,
-        sag: dict[int, int] | None = None,
+        sag: dict[int, int | Callable[[int], int]] | None = None,
         needs: dict[int, Callable[[int], int]] | None = None,
         speeds: dict[int, Callable[["_Joints"], int]] | None = None,
     ):
@@ -588,7 +588,9 @@ class _Joints:
             angle = self.angles[id_]
             target = self.bus.stored(id_, "goal_position") - self.bus.stored(id_, "homing_offset")
             # The goal is an encoder reading: the joint turns the shorter way to the angle it reads.
-            target += round((angle - target) / self.resolution) * self.resolution - self.sag.get(id_, 0)
+            sag = self.sag.get(id_, 0)
+            sag = sag(angle) if callable(sag) else sag
+            target += round((angle - target) / self.resolution) * self.resolution - sag
             speed = self.speeds[id_](self) if id_ in self.speeds else self.speed
             turned = angle + max(-speed, min(speed, target - angle))
             self.angles[id_] = max(low, min(high, turned))
@@ -922,6 +924,54 @@ def test_a_stop_confirmed_in_one_posture_is_not_pressed_hard_again(limited_arm, 
     assert _limits(limited_arm, 1).count(500) == 2
 
 
+def test_the_survey_reads_gravity_from_the_held_sag_without_moving(arm, monkeypatch):
+    """Held where it is, the joint settles 30 ticks below its goal: gravity pulls it towards lower
+    readings, and no move each way is needed to tell."""
+    joints = _Joints(arm, {1: (0, 4095)}, sag={1: 30})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.enable_torque()
+
+    def move(motor, target, settle=False):
+        return arm.move_to_position(motor, target, tolerance=80, settle=settle)
+
+    assert arm._survey_gravity("dummy_1", 100, 4, move) == -1
+    goals = [value for id_, register, value in arm._bus.writes if register == "goal_position" and id_ == 1]
+    assert all(abs(goal - 2047) <= 8 for goal in goals)  # held, never turned 100 ticks either way
+
+
+def test_raising_a_link_upright_turns_it_against_gravity_until_balanced(arm, monkeypatch):
+    """Gravity pulls the joint towards lower readings, less the closer it is to 2400, where the
+    link stands upright: the raise stops near there, within its 5 steps of 60 ticks."""
+    joints = _Joints(arm, {1: (0, 4095)}, start=2100, sag={1: lambda angle: max(0, (2400 - angle) // 8)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.enable_torque()
+
+    def move(motor, target, settle=False):
+        return arm.move_to_position(motor, target, tolerance=80, settle=settle)
+
+    turned = arm._raise_joint("dummy_1", -1, "upright", move)
+
+    assert 180 <= turned <= 300
+    assert joints.angles[1] > 2250
+
+
+@pytest.mark.parametrize(
+    "gravity, signs",
+    [
+        ({"dummy_1": 1, "dummy_3": 1}, [-1.0]),
+        ({"dummy_1": -1, "dummy_3": 1}, [1.0]),
+        ({"dummy_1": 1}, [1.0, -1.0]),
+    ],
+    ids=["both pull up", "opposite pulls", "follower unknown: both"],
+)
+def test_a_level_follower_turns_against_its_gravity_as_the_searched_joint_turns_with_its_own(gravity, signs):
+    postures = [{"dummy_3": Follow(1.0, lift=50, level=True)}]
+
+    resolved = SerialMotorsBus._resolve_raised(postures, gravity, "dummy_1")
+
+    assert [p["dummy_3"] for p in resolved] == [Follow(sign, lift=50) for sign in signs]
+
+
 def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blocked(arm, monkeypatch):
     joints = _Joints(arm, {1: (2040, 2050), 2: (0, 4095), 3: (0, 4095)})
     monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
@@ -971,3 +1021,44 @@ def test_setup_motors_asks_for_one_motor_at_a_time(motors, order, bus, monkeypat
         f"Connect the controller board to the '{motor}' motor only and press enter." for motor in order
     ]
     assert f"'{order[0]}' motor id set to {bus.motors[order[0]].id}" in capsys.readouterr().out
+
+
+def test_a_joint_shoved_by_a_push_is_let_go_before_the_pushed_joint_turns_back(arm, monkeypatch):
+    """Near its high stop, `dummy_1` presses the hand into a wall, which shoves `dummy_3` 300 ticks
+    from its goal. `dummy_3` is let go where it was shoved before `dummy_1` turns back, so it does
+    not spring back into the wall, then put back where it was held."""
+    released: list[int] = []
+
+    def wrist(joints: _Joints) -> tuple[int, int]:
+        return (2347 if joints.angles[1] > 2800 else 600), 3500
+
+    joints = _Joints(arm, {1: (1000, 3000), 2: (0, 4095), 3: wrist})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    write = arm.write
+
+    def watch(register, motor, value, **kwargs):
+        if register == "Goal_Position" and motor == "dummy_3" and joints.angles[1] > 2800:
+            released.append(value)
+        return write(register, motor, value, **kwargs)
+
+    monkeypatch.setattr(arm, "write", watch)
+
+    arm.record_calibration_from_hard_stops(
+        "position", full_turn_motors=["dummy_2"], motors=["dummy_1", "dummy_3", "dummy_2"]
+    )
+
+    assert released and all(value >= 2340 for value in released)  # let go, shoved, at the wall
+
+
+def test_a_raise_blocked_at_once_turns_nothing_and_lets_go(arm, monkeypatch):
+    """Told gravity pulls towards higher readings, the joint is raised towards lower ones, onto
+    what it rests on 10 ticks below: blocked at once, it turns nothing and goes back to its goal."""
+    joints = _Joints(arm, {1: (2050, 4095)}, start=2060)
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.enable_torque()
+
+    def move(motor, target, settle=False):
+        return arm.move_to_position(motor, target, tolerance=80, settle=settle)
+
+    assert arm._raise_joint("dummy_1", 1, "level", move) == 0
+    assert arm.read("Goal_Position", "dummy_1", normalize=False) == 2060

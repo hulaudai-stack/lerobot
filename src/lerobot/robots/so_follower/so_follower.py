@@ -41,19 +41,17 @@ _HARD_STOP_SEARCH_ORDER = [
 ]
 # Postures each joint is also searched from: a stop the table or another link hides in one posture is reached
 # in another, and the range spans the furthest stops of all. The wrist is bent both ways while the elbow folds
-# onto the upper arm. While the shoulder tips forward and back, the wrist is bent upward, as the survey of the
-# joints found gravity pulling it, and the elbow turns against the shoulder to keep the hand up: whichever way
-# the servos are mounted, one of its two directions keeps the forearm level, and the other only meets the table
-# sooner, at a reduced torque. The shoulder pans with the upper arm upright, the forearm raised and the wrist
-# straight, the arm a column over the base, so the hand sweeps into neither a wall behind it nor the table.
+# onto the upper arm. While the shoulder tips forward and back, the elbow turns against it to keep the forearm
+# level, in the direction the survey of the joints found gravity pulling them. Tipping forward, the hand clears
+# the table with the forearm lifted 20 degrees and the wrist bent upward; tipping back, it clears a wall close
+# behind the arm with the wrist straight: bent upward, the hand would curl into the wall. The shoulder pans with
+# the upper arm upright, the forearm raised and the wrist straight, the arm a column over the base, so the hand
+# sweeps into neither a wall behind it nor the table.
 _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
     "elbow_flex": [{"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
-    "shoulder_lift": [{"wrist_flex": Raised(), "elbow_flex": Follow(ratio)} for ratio in (1.0, -1.0)]
-    + [
-        # From a forearm lifted 20 degrees, the hand clears the table sooner when the shoulder tips forward;
-        # level, it clears a wall sooner when the shoulder tips back.
-        {"wrist_flex": Raised(), "elbow_flex": Follow(ratio, lift=230)}
-        for ratio in (1.0, -1.0)
+    "shoulder_lift": [
+        {"wrist_flex": Raised(), "elbow_flex": Follow(1.0, lift=230, level=True)},
+        {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
     ],
     "shoulder_pan": [{"shoulder_lift": 0.5, "elbow_flex": Raised(), "wrist_flex": 0.5}],
 }
@@ -197,6 +195,12 @@ class SOFollower(Robot):
             postures=_HARD_STOP_SEARCH_POSTURES,
             revisit=_HARD_STOP_REVISITS,
             lift={"elbow_flex": 230},
+            # Only the forearm is raised off the table at the start: tipping the upper arm upright
+            # would lean it back, towards a wall close behind the arm.
+            raise_arm={"elbow_flex": "level"},
+            # Moves between searches press no harder than 45% of a servo's torque on whatever they
+            # meet, as the hand a wall, unless blocked.
+            move_torque_limit=450,
         )
 
     def configure(self) -> None:

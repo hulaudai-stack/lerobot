@@ -21,10 +21,10 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, partial
 from pprint import pformat
 from typing import TYPE_CHECKING
 
@@ -50,10 +50,13 @@ class Follow:
     from where it started, within its own range. A ratio of 1 or -1 makes a joint cancel the turn of
     the one searched, e.g. an elbow keeping the forearm level while the shoulder tips. With
     `lift`, it first turns that many ticks against gravity, as the survey found it, and follows
-    from there."""
+    from there. With `level`, the sign of `ratio` is chosen from the survey so that the follower
+    turns against its own gravity as the searched joint turns with its gravity, which keeps a
+    forearm level as the shoulder tips; when either pull is unknown, both signs are tried."""
 
     ratio: float
     lift: int = 0
+    level: bool = False
 
 
 @dataclass(frozen=True)
@@ -1323,6 +1326,17 @@ class SerialMotorsBus(MotorsBusBase):
         moves it and returns where it came to rest."""
         if ticks <= 0:
             return 0
+        # Held where it is, a joint settles short of its goal the way gravity pulls it, with no
+        # move that could press something, as a hand resting near the table. A sag too small to
+        # tell from friction is surveyed by turning the joint each way.
+        goal = int(self.read("Goal_Position", motor, normalize=False))
+        held = move(motor, goal, settle=True) - goal
+        if abs(held) >= 2 * threshold:
+            pulled = 1 if held > 0 else -1
+            logger.info(
+                f"{motor}: held sag {held:+d} ticks, gravity pulls towards {('lower', 'higher')[pulled > 0]} readings"
+            )
+            return pulled
         start = int(self.read("Present_Position", motor, normalize=False))
         sags = []
         for direction in (1, -1):
@@ -1341,18 +1355,81 @@ class SerialMotorsBus(MotorsBusBase):
         )
         return pulled
 
+    def _raise_joint(
+        self,
+        motor: str,
+        pulled: int,
+        mode: str,
+        move: Callable[..., int],
+        step: int = 60,
+        max_steps: int = 12,
+        threshold: int = 4,
+    ) -> int:
+        """Turn a held `motor` against gravity, which pulls it towards `pulled` (+1 higher readings,
+        -1 lower), `step` ticks at a time, letting it settle after each to measure how far gravity
+        still holds it short of its goal, its sag:
+        - `"upright"`: until the sag falls to a third of the most seen, or reverses, and no more
+          than 5 steps: the link stands over its joint, as an upper arm made vertical, which
+          lifts the whole arm;
+        - `"level"`: until the sag, having grown, falls back below nine tenths of the most seen:
+          the link has passed level and points a little up, as a forearm lifting the hand.
+        A joint that cannot turn further, against something or a stop, or turns less than half a
+        step, as one pressing down on what it rests on, goes back to where it last turned freely.
+
+        Returns:
+            `int`: The ticks the joint turned: none if its first step was blocked, as when the
+            survey misread a joint resting on something, which pulls it the other way.
+        """
+        start = target = int(self.read("Goal_Position", motor, normalize=False))
+        try:
+            last = move(motor, start, settle=True)
+        except RuntimeError:
+            last = int(self.read("Present_Position", motor, normalize=False))
+        peak = 0.0
+        # Upright, a link with others held out past it balances beyond vertical: no further
+        # than a few steps, enough to lift a hand off the table, never to tip the arm back.
+        for _ in range(max_steps if mode == "level" else min(max_steps, 5)):
+            goal = target - pulled * step
+            try:
+                rest = move(motor, goal, settle=True)
+            except RuntimeError:
+                rest = None
+            if rest is None or -pulled * (rest - last) < step // 2:
+                with suppress(RuntimeError):
+                    move(motor, target, settle=True)
+                break
+            load = pulled * (rest - goal)
+            peak = max(peak, load)
+            target, last = goal, rest
+            if mode == "upright" and (load < threshold or load < peak / 3):
+                break
+            if mode == "level" and peak >= threshold and load < 0.9 * peak:
+                break
+        logger.info(f"{motor}: raised {abs(target - start)} ticks against gravity ({mode})")
+        return abs(target - start)
+
     @staticmethod
     def _resolve_raised(
-        postures: Sequence[Mapping[str, float | Follow | Raised]], gravity: Mapping[str, int]
+        postures: Sequence[Mapping[str, float | Follow | Raised]],
+        gravity: Mapping[str, int],
+        searched: str | None = None,
     ) -> list[dict[str, float | Follow]]:
         """Place each [`Raised`] motor of `postures` at the end of its range gravity pulls away
-        from, a posture tried at both ends for a motor whose survey found no pull."""
+        from, a posture tried at both ends for a motor whose survey found no pull, and give each
+        `level` [`Follow`] of the `searched` motor its sign, both signs when a pull is unknown."""
         resolved: list[dict[str, float | Follow]] = []
         for posture in postures:
             expanded: list[dict[str, float | Follow]] = [{}]
             for other, place in posture.items():
-                if not isinstance(place, Raised):
-                    ends: tuple[float | Follow, ...] = (place,)
+                if isinstance(place, Follow) and place.level:
+                    follower, leader = gravity.get(other, 0), gravity.get(searched or "", 0)
+                    size = abs(place.ratio)
+                    signs = (-follower * leader,) if follower and leader else (1, -1)
+                    ends: tuple[float | Follow, ...] = tuple(
+                        Follow(sign * size, place.lift) for sign in signs
+                    )
+                elif not isinstance(place, Raised):
+                    ends = (place,)
                 elif gravity.get(other, 0):
                     ends = (1.0 if gravity[other] < 0 else 0.0,)
                 else:
@@ -1372,6 +1449,7 @@ class SerialMotorsBus(MotorsBusBase):
         postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
         revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
         lift: Mapping[str, int] | None = None,
+        raise_arm: Mapping[str, str] | None = None,
         confirm_tolerance: int = 15,
         return_tolerance: int = 80,
         survey_ticks: int = 100,
@@ -1385,6 +1463,8 @@ class SerialMotorsBus(MotorsBusBase):
         load_stall: float | None = 0.9,
         trust_impacts: bool = True,
         working_torque_limit: int | None = None,
+        move_torque_limit: int | None = None,
+        release_ticks: int | None = 50,
         period_s: float = 0.02,
     ) -> dict[str, MotorCalibration]:
         """Calibrate motors by driving each joint into its two hard stops, instead of by hand.
@@ -1442,6 +1522,12 @@ class SerialMotorsBus(MotorsBusBase):
                 where it started: an elbow lifting a hand that started low, clear of the table the
                 first searches could press it into. A motor the survey found no pull on stays
                 where it is.
+            raise_arm (`Mapping[str, str]`, *optional*):
+                Motors turned against gravity before anything else, in this order, each surveyed
+                just before: `"upright"` until its link stands over it, `"level"` until its link
+                points a little above level (see [`~SerialMotorsBus._raise_joint`]). Each holds
+                there until its own search, which starts from where the arm was put. A hand
+                resting on the table is lifted off it, so that no search presses it there.
             confirm_tolerance (`int`, *optional*, defaults to `15`):
                 Ticks a stronger push may gain over the last one and still confirm the stop.
             return_tolerance (`int`, *optional*, defaults to `80`):
@@ -1467,6 +1553,15 @@ class SerialMotorsBus(MotorsBusBase):
                 Raw `Torque_Limit` of every motor for the whole calibration, restored after it:
                 what holding and moving the arm may use, while pushes towards a stop use
                 `torque_limits`. `None` leaves the motors' own limits.
+            move_torque_limit (`int`, *optional*):
+                Raw `Torque_Limit` of a motor while it moves between searches: a move that meets
+                something, as a hand brushing a wall, presses no harder than that. Only a move
+                blocked at it is made again at the motor's own limit. `None` moves at the own limit.
+            release_ticks (`int`, *optional*, defaults to `50`):
+                A joint pushed further than this from its goal while another met a wall, as the
+                shoulder when the hand presses on one, is let go where it is before that other joint
+                turns back, then put back: holding on, it would press the hand into the wall as it
+                springs back, and wedge it. `None` holds every joint throughout.
             trust_impacts (`bool`, *optional*, defaults to `True`):
                 A stop is confirmed by its first push when the joint ran into it at speed: no
                 stronger push follows. `False` confirms every stop with a stronger push.
@@ -1589,22 +1684,77 @@ class SerialMotorsBus(MotorsBusBase):
 
         free_step = move_step or step
 
+        def gently(motor: str, target: int, escalate: bool = True, **kwargs) -> int:
+            """Move at `move_torque_limit`, and again at the motor's own limit only if blocked."""
+            go = partial(
+                self.move_to_position, motor, target, step=free_step, period_s=period_s,
+                tolerance=return_tolerance, **kwargs,
+            )  # fmt: skip
+            if move_torque_limit is None or not self._has_register(motor, "Torque_Limit"):
+                return go()
+            own = int(self.read("Torque_Limit", motor, normalize=False))
+            self.write("Torque_Limit", motor, min(own, move_torque_limit), normalize=False)
+            try:
+                return go()
+            except RuntimeError:
+                if not escalate:
+                    position = int(self.read("Present_Position", motor, normalize=False))
+                    self.write("Goal_Position", motor, position, normalize=False)
+                    raise
+                logger.info(f"{motor}: blocked at torque limit {move_torque_limit}, moving at {own}")
+                self.write("Torque_Limit", motor, own, normalize=False)
+                return go()
+            finally:
+                self.write("Torque_Limit", motor, own, normalize=False)
+
         def move(motor: str, position: int) -> None:
             current = int(self.read("Present_Position", motor, normalize=False)) - shifts[motor]
             follow_state["motion"] = (position > current) - (position < current)
-            self.move_to_position(
-                motor,
-                position + shifts[motor],
-                step=free_step,
-                period_s=period_s,
-                tolerance=return_tolerance,
-                on_step=on_step(motor),
-            )
+            gently(motor, position + shifts[motor], on_step=on_step(motor))
 
         def move_raw(motor: str, target: int, settle: bool = False) -> int:
-            return self.move_to_position(
-                motor, target, step=free_step, period_s=period_s, tolerance=return_tolerance, settle=settle
-            )
+            return gently(motor, target, settle=settle)
+
+        def raise_move(motor: str, target: int, settle: bool = False) -> int:
+            # A raise blocked at the move limit stops there: it presses on whatever it met no harder.
+            return gently(motor, target, escalate=False, settle=settle)
+
+        def put_back(motor: str, goal: int) -> None:
+            """Return a released joint to its goal no harder than the strongest push: a joint that
+            meets something on the way, as a bent hand the table, stays where it was stopped."""
+            limit = max(torque_limits) if torque_limits else None
+            if move_torque_limit is not None:
+                limit = move_torque_limit if limit is None else min(limit, move_torque_limit)
+            if limit is None or not self._has_register(motor, "Torque_Limit"):
+                gently(motor, goal)
+                return
+            own = int(self.read("Torque_Limit", motor, normalize=False))
+            self.write("Torque_Limit", motor, min(own, limit), normalize=False)
+            try:
+                self.move_to_position(
+                    motor, goal, step=free_step, period_s=period_s, tolerance=return_tolerance
+                )
+            except RuntimeError:
+                position = int(self.read("Present_Position", motor, normalize=False))
+                self.write("Goal_Position", motor, position, normalize=False)
+                logger.info(f"{motor}: stopped {abs(goal - position)} ticks short of its goal, left there")
+            finally:
+                self.write("Torque_Limit", motor, own, normalize=False)
+
+        def release(pushed: str) -> dict[str, int]:
+            """Let go, where they are, of the joints pushed away from their goals; their goals."""
+            released = {}
+            for other in motor_names:
+                if other == pushed or other in followers:
+                    continue
+                goal = int(self.read("Goal_Position", other, normalize=False))
+                present = int(self.read("Present_Position", other, normalize=False))
+                if release_ticks is not None and abs(present - goal) > release_ticks:
+                    self.write("Goal_Position", other, present, normalize=False)
+                    released[other] = goal
+            if released:
+                logger.info(f"{pushed}: let go of {sorted(released)}, pushed from their goals")
+            return released
 
         limited = (
             [m for m in motor_names if self._has_register(m, "Torque_Limit")] if working_torque_limit else []
@@ -1623,11 +1773,33 @@ class SerialMotorsBus(MotorsBusBase):
                 self.write("Torque_Limit", motor, working_torque_limit, normalize=False)
             self.enable_torque(motor_names)
 
+            # Raise: before anything else moves, the arm is lifted clear of the table it may rest
+            # on, one joint after the other, each surveyed first: a hand resting on the table
+            # carries the arm's weight, which hides the pull of gravity on the joints above it.
+            gravity: dict[str, int] = {}
+            raised_from: dict[str, int] = {}
+            for motor, mode in (raise_arm or {}).items():
+                if motor not in searched:
+                    continue
+                gravity[motor] = self._survey_gravity(motor, survey_ticks, gravity_threshold, move_raw)
+                if gravity[motor]:
+                    raised_from[motor] = starts[motor]
+                    if not self._raise_joint(
+                        motor, gravity[motor], mode, raise_move, threshold=gravity_threshold
+                    ):
+                        # Blocked at once, the joint was turning down onto what it rests on, as a hand
+                        # on the table, which also misled the survey: gravity pulls the other way.
+                        gravity[motor] = -gravity[motor]
+                        logger.info(f"{motor}: blocked at once, gravity pulls the other way")
+                        self._raise_joint(
+                            motor, gravity[motor], mode, raise_move, threshold=gravity_threshold
+                        )
+                    starts[motor] = int(self.read("Present_Position", motor, normalize=False)) - shifts[motor]
+
             # Survey: turn each joint a little each way to learn where gravity pulls it.
-            gravity = {
-                motor: self._survey_gravity(motor, survey_ticks, gravity_threshold, move_raw)
-                for motor in searched
-            }
+            for motor in searched:
+                if motor not in gravity:
+                    gravity[motor] = self._survey_gravity(motor, survey_ticks, gravity_threshold, move_raw)
 
             # Lift: links turned up a little, away from the table, for the searches before their own.
             lifted_from: dict[str, int] = {}
@@ -1644,6 +1816,11 @@ class SerialMotorsBus(MotorsBusBase):
             schedule = [(motor, postures.get(motor) or [{}]) for motor in searched] + list(revisit.items())
             found: dict[str, dict[int, tuple[int, bool]]] = {}
             for motor, motor_postures in schedule:
+                if motor in raised_from:
+                    # Its own search starts where the arm was put: the raise only kept the hand
+                    # off the table for the joints searched before.
+                    starts[motor] = raised_from.pop(motor)
+                    move(motor, starts[motor])
                 stops.clear()
                 stops.update(found.get(motor, {}))
                 # A joint to raise whose survey found no pull, as one standing near upright when the
@@ -1668,7 +1845,7 @@ class SerialMotorsBus(MotorsBusBase):
                         move(other, starts[other])
                     for other in placed:
                         move(other, starts[other])
-                for posture in self._resolve_raised(motor_postures, gravity):
+                for posture in self._resolve_raised(motor_postures, gravity, motor):
                     for other, place in posture.items():
                         if not isinstance(place, (Follow, Raised)):
                             low, high = range_mins[other], range_maxes[other]
@@ -1704,7 +1881,10 @@ class SerialMotorsBus(MotorsBusBase):
                         if direction == -1 and 1 not in stops:
                             # The low stop near the bottom of the encoder leaves the high stop room.
                             rehome(motor, stops[-1][0], guard + margin)
+                        released = release(motor) if release_ticks is not None else {}
                         move(motor, starts[motor])
+                        for other, goal in released.items():
+                            put_back(other, goal)
                     # The range found so far centred on the encoder leaves room both ways for the
                     # next posture, should it reach further, as a joint once too weak to lift.
                     rehome(motor, (stops[-1][0] + stops[1][0]) // 2, middles[motor])

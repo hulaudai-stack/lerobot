@@ -45,12 +45,19 @@ POSTURE_SETS = {
     "lean_shoulder": {"shoulder_lift": "follow_only"},
     "lean_elbow": {"elbow_flex": "wrist_bent_only"},
     "lean_both": {"shoulder_lift": "follow_only", "elbow_flex": "wrist_bent_only"},
+    # The elbow's follow direction chosen from the survey: 2 shoulder postures instead of 4.
+    "level": {"shoulder_lift": "level"},
+    "level_lift_only": {"shoulder_lift": "level_lift_only"},
+    # A straight wrist as well: curled up, the hand meets a close wall when the shoulder tips back.
+    "plus_straight": {"shoulder_lift": "plus_straight"},
+    "level_straight": {"shoulder_lift": "level_straight"},
+    "level_mixed": {"shoulder_lift": "level_mixed"},
 }
 
 DEFAULTS = {
     "step": 8,
     "move_step": 8,
-    "torque_limits": [150, 300, 500],
+    "torque_limits": [150, 300],
     "stall_error": 150,
     "stall_cycles": 3,
     "survey_ticks": 100,
@@ -64,14 +71,14 @@ DEFAULTS = {
 SPACE = {
     "step": [8],
     "move_step": [8],
-    "torque_limits": [[150, 300], [150, 250, 350], [150, 300, 400], [150, 300, 500], [150, 250]],
-    "stall_error": [150, 200],
+    "torque_limits": [[150, 300], [150, 250, 400], [150, 300, 500], [150, 250]],
+    "stall_error": [150],
     "stall_cycles": [3, 4],
-    "survey_ticks": [100],
-    "postures": list(POSTURE_SETS),
-    "load_stall": [0.8, 0.9],
+    "survey_ticks": [60, 100],
+    "postures": ["default", "level", "level_lift_only", "lean_elbow"],
+    "load_stall": [0.9],
     "trust_impacts": [True],
-    "working_torque_limit": [300, 350, 400, 500, None],
+    "working_torque_limit": [350, 400, 500, None],
 }
 
 
@@ -84,6 +91,25 @@ def postures_for(name: str):
     if lean.get("shoulder_lift") == "follow_only":
         postures["shoulder_lift"] = [
             p for p in postures["shoulder_lift"] if any(isinstance(v, Follow) for v in p.values())
+        ]
+    if lean.get("shoulder_lift") in ("level", "level_lift_only"):
+        lifts = (230,) if lean["shoulder_lift"] == "level_lift_only" else (0, 230)
+        raised = postures["shoulder_lift"][0]["wrist_flex"]
+        postures["shoulder_lift"] = [
+            {"wrist_flex": raised, "elbow_flex": Follow(1.0, lift=lift, level=True)} for lift in lifts
+        ]
+    if lean.get("shoulder_lift") in ("plus_straight", "level_straight"):
+        if lean["shoulder_lift"] == "level_straight":
+            raised = postures["shoulder_lift"][0]["wrist_flex"]
+            postures["shoulder_lift"] = [
+                {"wrist_flex": raised, "elbow_flex": Follow(1.0, lift=lift, level=True)} for lift in (0, 230)
+            ]
+        postures["shoulder_lift"].append({"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)})
+    if lean.get("shoulder_lift") == "level_mixed":
+        raised = postures["shoulder_lift"][0]["wrist_flex"]
+        postures["shoulder_lift"] = [
+            {"wrist_flex": raised, "elbow_flex": Follow(1.0, lift=230, level=True)},
+            {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
         ]
     if lean.get("elbow_flex") == "wrist_bent_only":
         postures["elbow_flex"] = [p for p in postures["elbow_flex"] if p]
@@ -173,16 +199,27 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
             stall_error=params["stall_error"],
             **{
                 key: params[key]
-                for key in ("load_stall", "trust_impacts", "working_torque_limit")
+                for key in ("load_stall", "trust_impacts", "working_torque_limit", "move_torque_limit")
                 if key in params
             },
             stall_cycles=params["stall_cycles"],
             survey_ticks=params["survey_ticks"],
             postures=postures_for(params["postures"]),
+            **params.get("bus", {}),
         )
         return original(*args, **kwargs)
 
     robot.bus.record_calibration_from_hard_stops = tuned
+    # Steps: each push towards a stop, and each move of a joint, as the bus makes them.
+    steps = {"pushes": 0, "moves": 0}
+    for method, key in (("find_hard_stop", "pushes"), ("move_to_position", "moves")):
+        bound = getattr(robot.bus, method)
+
+        def counted(*args, _bound=bound, _key=key, **kwargs):
+            steps[_key] += 1
+            return _bound(*args, **kwargs)
+
+        setattr(robot.bus, method, counted)
     handler = None
     if video is not None:
         from so101sim import CaptionHandler
@@ -228,6 +265,10 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
         "wall_gap": case["wall_gap"],
         "peak_pct": round(max(arm.peak_torque[j] for j in stressed) / MAX_TORQUE_NM * 100, 1),
         "hard_push_s": round(sum(arm.hard_push_s[j] for j in stressed), 2),
+        "contact_n": round(arm.peak_contact_n, 1),
+        "pushes": steps["pushes"],
+        "moves": steps["moves"],
+        "contact_on": arm.peak_contact_on,
         "stress": {
             j: [round(arm.peak_torque[j] / MAX_TORQUE_NM * 100, 1), round(arm.hard_push_s[j], 2)]
             for j in stressed
@@ -242,14 +283,15 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
 
 
 def stress_score(results: list[dict]) -> float:
-    """What the optimiser minimises among settings that find every stop: the mean peak torque, in
-    % of the servos' maximum, plus the mean seconds spent above 20% of it, plus a twentieth of the
-    mean calibration time in seconds."""
+    """What the optimiser minimises among settings that find every stop: the mean calibration time
+    in seconds, the fewer steps the better, plus the mean peak torque in % of the servos' maximum,
+    plus three times the mean peak force in newtons the arm pressed on the table, wall or clamps:
+    10 s of calibration weigh as much as 10% more torque, or 3.3 N more pressure."""
     n = len(results)
     return (
-        sum(r["peak_pct"] for r in results) / n
-        + sum(r["hard_push_s"] for r in results) / n
-        + 0.05 * sum(r["sim_s"] for r in results) / n
+        sum(r["sim_s"] for r in results) / n
+        + sum(r["peak_pct"] for r in results) / n
+        + 3 * sum(r.get("contact_n", 0) for r in results) / n
     )
 
 
@@ -258,7 +300,9 @@ def summary(results: list[dict]) -> str:
     return (
         f"{sum(r['passed'] for r in results)}/{n} pass, peak {sum(r['peak_pct'] for r in results) / n:.0f}% "
         f"(max {max(r['peak_pct'] for r in results):.0f}%), {sum(r['hard_push_s'] for r in results) / n:.1f}s "
-        f"above 20%, {sum(r['sim_s'] for r in results) / n:.0f}s"
+        f"above 20%, {sum(r['sim_s'] for r in results) / n:.0f}s, contact "
+        f"{sum(r.get('contact_n', 0) for r in results) / n:.1f}N (max {max(r.get('contact_n', 0) for r in results):.1f}N), "
+        f"{sum(r.get('pushes', 0) for r in results) / n:.0f} pushes + {sum(r.get('moves', 0) for r in results) / n:.0f} moves"
     )
 
 
@@ -295,7 +339,8 @@ class Study:
         if todo:
             if self._pool is None:
                 # One pool for the whole study: its workers import LeRobot once.
-                self._pool = ProcessPoolExecutor(max_workers=self.workers)
+                # Workers are replaced every 20 runs: memory grows a little with each one.
+                self._pool = ProcessPoolExecutor(max_workers=self.workers, max_tasks_per_child=20)
             for result in self._pool.map(run_case, [(params, self.case(i)) for i in todo]):
                 done[str(result["case"])] = result
                 self.save()

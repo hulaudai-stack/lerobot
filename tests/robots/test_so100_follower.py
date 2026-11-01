@@ -164,6 +164,8 @@ def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
         postures=_HARD_STOP_SEARCH_POSTURES,
         revisit=_HARD_STOP_REVISITS,
         lift={"elbow_flex": 230},
+        raise_arm={"elbow_flex": "level"},
+        move_torque_limit=450,
     )
     follower.bus.write_calibration.assert_called_once_with({})
 
