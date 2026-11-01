@@ -415,6 +415,9 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--replay", type=int, nargs="*", help="scenarios to replay on video, then exit")
     parser.add_argument(
+        "--check", type=int, nargs=2, metavar=("FIRST", "LAST"), help="check the current settings, then exit"
+    )
+    parser.add_argument(
         "--holdout", type=int, nargs=2, metavar=("FIRST", "LAST"), help="scenarios to check the best on"
     )
     args = parser.parse_args()
@@ -424,6 +427,11 @@ def main() -> None:
         for index in args.replay:
             result = run_case((DEFAULTS, study.case(index)), video=args.out / f"case{index}.mp4")
             print(json.dumps(result))
+        return
+    if args.check:
+        results = study.evaluate("current", DEFAULTS, list(range(args.check[0], args.check[1] + 1)))
+        study.log(summary(results))
+        study.log(f"Failed: {[r['case'] for r in results if not r['passed']]}")
         return
 
     study.log(f"Phase 1: current settings on {args.scenarios} scenarios")
