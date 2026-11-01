@@ -50,11 +50,12 @@ _HARD_STOP_SEARCH_ORDER = [
 _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | Toward]]] = {
     "elbow_flex": [{"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
     "shoulder_lift": [
-        # Found in simulation as the clearest way to each stop: tipping forward, the forearm folds
-        # up and the wrist curls up, the arm compact over the table; tipping back, the forearm
-        # straightens nearly in line with the upper arm and the wrist bends a little down, clear of
-        # a wall 3.5 cm behind the base. Fractions from the end gravity pulls each joint towards.
-        {"elbow_flex": Toward(down=0.97, up=0.42), "wrist_flex": Toward(down=0.87, up=0.21)},
+        # Found in simulation (`posture_search.py`) as the ways to each stop that leave the links the
+        # most room, from any middle-pose start, a wall 3.5 cm behind the base: tipping forward, the
+        # forearm turns up into line with the upper arm and the hand curls up, off the table; tipping
+        # back, the forearm folds forward, over the base, and the hand stays straight, both away
+        # from the wall. Fractions from the end gravity pulls each joint towards.
+        {"elbow_flex": Toward(down=0.97, up=0.13), "wrist_flex": Toward(down=0.82, up=0.45)},
         {"wrist_flex": Raised(), "elbow_flex": Follow(1.0, lift=230, level=True)},
         {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
     ],
