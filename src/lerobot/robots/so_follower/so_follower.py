@@ -38,13 +38,14 @@ from .config_so_follower import SOFollowerRobotConfig
 
 logger = logging.getLogger(__name__)
 
-# Order in which automatic calibration searches the joints' stops: the wrist and gripper while the arm
-# is still compact, the shoulder last. `wrist_roll` turns freely, so it is homed but not searched.
+# Order in which automatic calibration searches the joints' stops: the shoulder first, tipped fully back
+# and forward while the elbow and wrist turn out of the way, then the gripper and wrist, the elbow, the pan.
+# `wrist_roll` turns freely, so it is homed but not searched.
 _HARD_STOP_SEARCH_ORDER = [
+    "shoulder_lift",
     "gripper",
     "wrist_flex",
     "elbow_flex",
-    "shoulder_lift",
     "shoulder_pan",
     "wrist_roll",
 ]
@@ -66,6 +67,18 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | T
         {"wrist_flex": 0.15},
         {"wrist_flex": 0.85},
     ],
+    # Found in simulation, from any middle-pose start, a wall 3.5 cm behind the base: tipping back, the
+    # forearm folds 60 degrees forward, over the base, the wrist held, and the arm clears the wall; tipping
+    # forward, the forearm turns up 97 degrees and the wrist 60, the hand curled up off the table. Turns,
+    # as the elbow and wrist are not calibrated yet; 114 ticks are 10 degrees.
+    "shoulder_lift": [
+        {"elbow_flex": Turn(down=1104, up=-684), "wrist_flex": Turn(down=683, up=0)},
+    ],
+    "shoulder_pan": [{"shoulder_lift": 0.5, "elbow_flex": Raised(), "wrist_flex": 0.5}],
+}
+# Joints searched again at the end, should the range found fall short of the expected one. The shoulder in
+# postures that need the elbow and wrist calibrated.
+_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised | Toward | Turn]]] = {
     "shoulder_lift": [
         # Found in simulation (`posture_search.py`) as the ways to each stop that leave the links the
         # most room, from any middle-pose start, a wall 3.5 cm behind the base: tipping forward, the
@@ -76,13 +89,8 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | T
         {"wrist_flex": Raised(), "elbow_flex": Follow(1.0, lift=230, level=True)},
         {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
     ],
-    "shoulder_pan": [{"shoulder_lift": 0.5, "elbow_flex": Raised(), "wrist_flex": 0.5}],
-}
-# Joints searched again at the end. The elbow folds fully only with the wrist bent inward, and with the upper arm
-# upright: tilted back, the folding hand meets a wall behind the arm. The shoulder's tilt is only known once it is
-# calibrated, so the elbow folds once more with the upper arm upright and the wrist bent each way, as which way is
-# inward depends on how its servo is mounted.
-_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised | Toward | Turn]]] = {
+    # The elbow folds fully only with the wrist bent inward and the upper arm upright: once more with the
+    # wrist bent each way, as which way is inward depends on how its servo is mounted.
     "elbow_flex": [{"shoulder_lift": 0.5, "wrist_flex": 0.15}, {"shoulder_lift": 0.5, "wrist_flex": 0.85}],
 }
 

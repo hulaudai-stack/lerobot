@@ -159,7 +159,7 @@ def test_auto_calibrate_seeks_the_hard_stops(follower, monkeypatch):
     follower.bus.record_calibration_from_hard_stops.assert_called_once_with(
         "position",
         full_turn_motors=["wrist_roll"],
-        motors=["gripper", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan", "wrist_roll"],
+        motors=["shoulder_lift", "gripper", "wrist_flex", "elbow_flex", "shoulder_pan", "wrist_roll"],
         torque_limits=[150, 300],
         expected_ranges=follower.config.auto_calibration_expected_ranges,
         postures=_HARD_STOP_SEARCH_POSTURES,

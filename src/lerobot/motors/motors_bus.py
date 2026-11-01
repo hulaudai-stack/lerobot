@@ -87,7 +87,8 @@ class Toward:
 class Turn:
     """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor that turns,
     as the one searched sweeps from its start towards a stop, steadily by a number of ticks against
-    gravity, as the survey found it (negative: with gravity), which it has turned once the searched
+    gravity, as the survey found it (negative: with gravity), from where the arm was put, even if raised
+    since, which it has turned once the searched
     one has turned `reach` ticks: `down` while the searched joint turns the way gravity pulls it,
     `up` while it turns against gravity. Unlike [`Toward`], it needs no calibration of the motor,
     only its pull, so it moves the joints searched later out of the way: the upper arm tipped back a
@@ -1958,8 +1959,10 @@ class SerialMotorsBus(MotorsBusBase):
                             )
                         if isinstance(place, Turn) and gravity.get(other) and gravity.get(motor):
                             here = int(self.read("Present_Position", other, normalize=False))
-                            with_gravity = here - gravity[other] * place.down
-                            against = here - gravity[other] * place.up
+                            # Turned from where the arm was put, not from where a raise left it.
+                            origin = raised_from.get(other, here - shifts[other]) + shifts[other]
+                            with_gravity = origin - gravity[other] * place.down
+                            against = origin - gravity[other] * place.up
                             towards[other] = (
                                 here - shifts[other],
                                 with_gravity if gravity[motor] < 0 else against,
