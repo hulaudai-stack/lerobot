@@ -541,7 +541,10 @@ class _Joints:
     `time.sleep` is a tick in which every joint turns towards its goal, at most `speed` ticks,
     but no further than its stops. Stops may be a function of the joints, so that they depend
     on a joint's torque limit or another joint's angle. A joint with a `sag` settles that many
-    ticks below its goal, as one holding a load against gravity."""
+    ticks below its goal, as one holding a load against gravity. Each joint reports the load its
+    servo applies, in 0.1% of its maximum torque, as an STS3215 does: what it `needs` to turn at
+    its angle (nothing by default), plus 4 for each tick its goal leads it, up to its torque
+    limit."""
 
     def __init__(
         self,
@@ -550,8 +553,13 @@ class _Joints:
         start: int = 2047,
         speed: int = 10_000,
         sag: dict[int, int] | None = None,
+        needs: dict[int, Callable[[int], int]] | None = None,
+        speeds: dict[int, Callable[["_Joints"], int]] | None = None,
     ):
         self.bus, self.stops, self.speed, self.sag = arm._bus, stops, speed, sag or {}
+        self.needs = needs or {}
+        self.speeds = speeds or {}
+        self.ticks = 0
         self.angles = dict.fromkeys(arm.ids, start)
         self.resolution = arm.resolution("model_4")
         for id_ in arm.ids:
@@ -566,18 +574,43 @@ class _Joints:
     def _encode(self) -> None:
         for id_, angle in self.angles.items():
             offset = self.bus.stored(id_, "homing_offset")
-            self.bus.seed(id_, "present_position", (angle + offset) % self.resolution)
+            reading = (angle + offset) % self.resolution
+            self.bus.seed(id_, "present_position", reading)
+            lead = abs(self.bus.stored(id_, "goal_position") - reading)
+            need = self.needs.get(id_, lambda angle: 0)(angle)
+            limit = self.bus.registers.get((id_, "torque_limit"), 1000)
+            self.bus.seed(id_, "present_load", min(limit, need + 4 * lead))
 
     def tick(self, _seconds: float) -> None:
+        self.ticks += 1
         for id_, stops in self.stops.items():
             low, high = stops(self) if callable(stops) else stops
             angle = self.angles[id_]
             target = self.bus.stored(id_, "goal_position") - self.bus.stored(id_, "homing_offset")
             # The goal is an encoder reading: the joint turns the shorter way to the angle it reads.
             target += round((angle - target) / self.resolution) * self.resolution - self.sag.get(id_, 0)
-            turned = angle + max(-self.speed, min(self.speed, target - angle))
+            speed = self.speeds[id_](self) if id_ in self.speeds else self.speed
+            turned = angle + max(-speed, min(speed, target - angle))
             self.angles[id_] = max(low, min(high, turned))
         self._encode()
+
+
+@pytest.fixture
+def loaded_arm(arm, monkeypatch):
+    """The `arm`, its motors with a `Torque_Limit` at its maximum, and reporting their load."""
+    monkeypatch.setattr(DUMMY_3, "_registers", DUMMY_3._registers | {"torque_limit", "present_load"})
+    for id_ in arm.ids:
+        arm._bus.seed(id_, "torque_limit", 1000)
+    return arm
+
+
+def _limits(arm, motor_id: int) -> list[int]:
+    """The torque limits written to a motor for its pushes, its own limit restored after each left out."""
+    return [
+        v
+        for id_, register, v in arm._bus.writes
+        if register == "torque_limit" and id_ == motor_id and v != 1000
+    ]
 
 
 @pytest.fixture
@@ -813,6 +846,80 @@ def test_the_survey_raises_a_joint_against_gravity(sag, ends, arm, monkeypatch):
     )
 
     assert seen == ends
+
+
+def test_load_stall_ends_a_push_as_soon_as_the_joint_presses_its_stop(loaded_arm, monkeypatch):
+    """Still at its stop and pushing at its limit, the joint is stalled without its goal first
+    running `stall_error` ahead of it."""
+    durations = {}
+    for load_stall in (None, 0.9):
+        joints = _Joints(loaded_arm, {1: (1000, 2600)})
+        monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+        loaded_arm._bus.seed(1, "torque_limit", 150)
+        assert loaded_arm.find_hard_stop("dummy_1", 1, stall_error=200, load_stall=load_stall) == 2600
+        durations[load_stall] = joints.ticks
+    assert durations[0.9] < durations[None] - 15
+
+
+def test_a_stop_met_with_torque_to_spare_is_pressed_only_once(loaded_arm, monkeypatch):
+    """Moving freely up to its stops, the joint is pushed at the weakest torque only."""
+    joints = _Joints(loaded_arm, {1: (1000, 3000), 2: (0, 4095), 3: (0, 4095)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = loaded_arm.record_calibration_from_hard_stops(
+        "position", full_turn_motors=["dummy_2", "dummy_3"], torque_limits=[150, 300, 500]
+    )
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1067, 3027)
+    assert _limits(loaded_arm, 1) == [150, 150]
+
+
+def test_a_joint_slowing_as_its_load_nears_the_limit_is_pushed_harder(loaded_arm, monkeypatch, caplog):
+    """Lifting against gravity, the joint needs more torque the higher it goes: below a torque of
+    300 it slows down to a stall short of its stop, and at 300 it gets there."""
+    arm = loaded_arm
+
+    def weak(joints: _Joints) -> bool:
+        return joints.bus.stored(1, "torque_limit") < 300
+
+    def lifting(joints: _Joints) -> tuple[int, int]:
+        return 1000, (2300 if weak(joints) else 3000)
+
+    def speed(joints: _Joints) -> int:
+        return max(0, (2300 - joints.angles[1]) // 25) if weak(joints) else 10_000
+
+    joints = _Joints(
+        arm,
+        {1: lifting, 2: (0, 4095), 3: (0, 4095)},
+        needs={1: lambda a: max(0, (a - 1800) * 3 // 10)},
+        speeds={1: speed},
+    )
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    calibration = arm.record_calibration_from_hard_stops(
+        "position", full_turn_motors=["dummy_2", "dummy_3"], torque_limits=[150, 300, 500]
+    )
+
+    assert (calibration["dummy_1"].range_min, calibration["dummy_1"].range_max) == (1067, 3027)
+    assert 300 in _limits(arm, 1)
+    assert "may be short" not in caplog.text
+
+
+def test_a_stop_confirmed_in_one_posture_is_not_pressed_hard_again(limited_arm, monkeypatch):
+    """Without a load to tell a stop from a weak joint, the first posture confirms each stop
+    with a stronger push; the second only touches it."""
+    joints = _Joints(limited_arm, {1: (1000, 3000), 2: (0, 4095), 3: (1500, 2600)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+
+    limited_arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        torque_limits=[150, 500],
+        postures={"dummy_1": [{"dummy_3": 0.4}, {"dummy_3": 0.6}]},
+    )
+
+    assert _limits(limited_arm, 1).count(500) == 2
 
 
 def test_record_calibration_from_hard_stops_frees_the_motors_when_a_joint_is_blocked(arm, monkeypatch):

@@ -32,6 +32,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import so101sim  # noqa: E402,F401  (puts the LeRobot checkout under test first on the path)
 
 REACHABLE = {"elbow_flex": (-96.8, 90.4)}
 TOLERANCE_DEG = 3.0
@@ -48,22 +49,28 @@ POSTURE_SETS = {
 DEFAULTS = {
     "step": 8,
     "move_step": 8,
-    "torque_limits": [150, 500],
+    "torque_limits": [150, 300, 500],
     "stall_error": 150,
     "stall_cycles": 3,
     "survey_ticks": 100,
     "postures": "default",
+    "load_stall": 0.9,
+    "trust_impacts": True,
+    "working_torque_limit": None,
 }
+# Speeds stay at 8 ticks per 20 ms, and the first push at 15%: faster, or harder, wedges a hand
+# that starts near the table (see README). The rest is tuned for force first, then time.
 SPACE = {
-    # Faster moves fail: a hand that starts near the table swings into it and wedges (see README).
     "step": [8],
     "move_step": [8],
-    # A first push above 15% presses a hand near the table hard enough to wedge it.
-    "torque_limits": [[150, 300, 500], [150, 500], [150, 250, 500], [150, 350]],
-    "stall_error": [150, 200, 300],
-    "stall_cycles": [3, 4, 5],
-    "survey_ticks": [100, 150],
+    "torque_limits": [[150, 300], [150, 250, 350], [150, 300, 400], [150, 300, 500], [150, 250]],
+    "stall_error": [150, 200],
+    "stall_cycles": [3, 4],
+    "survey_ticks": [100],
     "postures": list(POSTURE_SETS),
+    "load_stall": [0.8, 0.9],
+    "trust_impacts": [True],
+    "working_torque_limit": [300, 350, 400, 500, None],
 }
 
 
@@ -163,6 +170,11 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
             step=params["step"],
             move_step=params.get("move_step", params["step"]),
             stall_error=params["stall_error"],
+            **{
+                key: params[key]
+                for key in ("load_stall", "trust_impacts", "working_torque_limit")
+                if key in params
+            },
             stall_cycles=params["stall_cycles"],
             survey_ticks=params["survey_ticks"],
             postures=postures_for(params["postures"]),
@@ -207,9 +219,18 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
             short = (round(ends[0] - true_low, 2), round(true_high - ends[1], 2))
             shortfalls[joint] = short
             worst = float(max(worst, *short))
+    from so101sim import MAX_TORQUE_NM
+
+    stressed = [j for j in JOINTS if j != "wrist_roll"]
     return {
         "case": case["index"],
         "wall_gap": case["wall_gap"],
+        "peak_pct": round(max(arm.peak_torque[j] for j in stressed) / MAX_TORQUE_NM * 100, 1),
+        "hard_push_s": round(sum(arm.hard_push_s[j] for j in stressed), 2),
+        "stress": {
+            j: [round(arm.peak_torque[j] / MAX_TORQUE_NM * 100, 1), round(arm.hard_push_s[j], 2)]
+            for j in stressed
+        },
         "error": error,
         "passed": bool(error is None and worst <= TOLERANCE_DEG),
         "worst_short_deg": round(worst, 2) if error is None else None,
@@ -219,9 +240,31 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
     }
 
 
+def stress_score(results: list[dict]) -> float:
+    """What the optimiser minimises among settings that find every stop: the mean peak torque, in
+    % of the servos' maximum, plus the mean seconds spent above 20% of it, plus a twentieth of the
+    mean calibration time in seconds."""
+    n = len(results)
+    return (
+        sum(r["peak_pct"] for r in results) / n
+        + sum(r["hard_push_s"] for r in results) / n
+        + 0.05 * sum(r["sim_s"] for r in results) / n
+    )
+
+
+def summary(results: list[dict]) -> str:
+    n = len(results)
+    return (
+        f"{sum(r['passed'] for r in results)}/{n} pass, peak {sum(r['peak_pct'] for r in results) / n:.0f}% "
+        f"(max {max(r['peak_pct'] for r in results):.0f}%), {sum(r['hard_push_s'] for r in results) / n:.1f}s "
+        f"above 20%, {sum(r['sim_s'] for r in results) / n:.0f}s"
+    )
+
+
 class Study:
     def __init__(self, out: Path, workers: int):
         self.out, self.workers = out, workers
+        self._pool: ProcessPoolExecutor | None = None
         self.state_path = out / "state.json"
         self.state = (
             json.loads(self.state_path.read_text())
@@ -249,15 +292,17 @@ class Study:
         done = self.state["runs"].setdefault(name, {"params": params, "results": {}})["results"]
         todo = [i for i in indices if str(i) not in done]
         if todo:
-            with ProcessPoolExecutor(max_workers=self.workers) as pool:
-                for result in pool.map(run_case, [(params, self.case(i)) for i in todo]):
-                    done[str(result["case"])] = result
-                    self.save()
-                    verdict = "PASS" if result["passed"] else "FAIL"
-                    why = result["error"] or f"worst short {result['worst_short_deg']}°"
-                    self.log(
-                        f"{name}: case {result['case']} wall {result['wall_gap']} {verdict} {result['sim_s']}s sim ({why})"
-                    )
+            if self._pool is None:
+                # One pool for the whole study: its workers import LeRobot once.
+                self._pool = ProcessPoolExecutor(max_workers=self.workers)
+            for result in self._pool.map(run_case, [(params, self.case(i)) for i in todo]):
+                done[str(result["case"])] = result
+                self.save()
+                verdict = "PASS" if result["passed"] else "FAIL"
+                why = result["error"] or f"worst short {result['worst_short_deg']}°"
+                self.log(
+                    f"{name}: case {result['case']} wall {result['wall_gap']} {verdict} {result['sim_s']}s sim ({why})"
+                )
         results = [done[str(i)] for i in indices]
         self.leaderboard()
         return results
@@ -269,21 +314,37 @@ class Study:
             if not results:
                 continue
             passed = sum(r["passed"] for r in results)
-            mean_s = sum(r["sim_s"] for r in results) / len(results)
-            rows.append((passed < len(results), mean_s, name, run["params"], passed, len(results)))
+            n = len(results)
+            rows.append(
+                (
+                    passed < n,
+                    stress_score(results),
+                    name,
+                    run["params"],
+                    passed,
+                    n,
+                    sum(r["peak_pct"] for r in results) / n,
+                    sum(r["hard_push_s"] for r in results) / n,
+                    sum(r["sim_s"] for r in results) / n,
+                )
+            )
         rows.sort()
         lines = [
             "# Auto-calibration settings leaderboard",
             "",
-            "Pass = every stop found within 3°. Time = simulated seconds per calibration, mean.",
+            "Pass = every stop found within 3°. Peak = largest torque any joint applied, % of the servo's"
+            " maximum, mean over scenarios. Above 20% = seconds per calibration any joint spent above 20%."
+            " Time = simulated seconds per calibration. Sorted by force, then time, among settings that pass.",
             "",
-            "| Settings | Passed | Mean time (s) | push step | move step | torque ladder | stall lead | stall cycles | survey | postures |",
-            "|---|---|---|---|---|---|---|---|---|---|",
+            "| Settings | Passed | Peak | Above 20% | Time (s) | torque ladder | working limit | stall lead "
+            "| stall cycles | load stall | postures |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
-        for _, mean_s, name, p, passed, total in rows:
+        for _, _, name, p, passed, total, peak, hard, mean_s in rows:
             lines.append(
-                f"| {name} | {passed}/{total} | {mean_s:.0f} | {p['step']} | {p.get('move_step', p['step'])} | {p['torque_limits']} | {p['stall_error']} "
-                f"| {p['stall_cycles']} | {p['survey_ticks']} | {p['postures']} |"
+                f"| {name} | {passed}/{total} | {peak:.0f}% | {hard:.1f}s | {mean_s:.0f} | {p['torque_limits']} "
+                f"| {p.get('working_torque_limit')} | {p['stall_error']} | {p['stall_cycles']} "
+                f"| {p.get('load_stall')} | {p['postures']} |"
             )
         (self.out / "leaderboard.md").write_text("\n".join(lines) + "\n")
 
@@ -295,6 +356,9 @@ def main() -> None:
     parser.add_argument("--candidates", type=int, default=24)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--replay", type=int, nargs="*", help="scenarios to replay on video, then exit")
+    parser.add_argument(
+        "--holdout", type=int, nargs=2, metavar=("FIRST", "LAST"), help="scenarios to check the best on"
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     study = Study(args.out, args.workers)
@@ -323,8 +387,8 @@ def main() -> None:
             seen.add(key)
             candidates[f"c{len(candidates):02d}"] = params
 
-    # Successive halving: cheap screening first, the fastest survivors on ever more scenarios.
-    rounds = [(4, 8), (12, 3), (args.scenarios, 1)]
+    # Successive halving: cheap screening first, the gentlest survivors on ever more scenarios.
+    rounds = [(6, 10), (24, 4), (args.scenarios, 2)]
     alive = dict(candidates)
     for budget, keep in rounds:
         study.log(f"Phase 2 round: {len(alive)} candidates on {budget} scenarios, keeping {keep}")
@@ -332,21 +396,24 @@ def main() -> None:
         for name, params in alive.items():
             results = study.evaluate(name, params, list(range(budget)))
             if all(r["passed"] for r in results):
-                scored.append((sum(r["sim_s"] for r in results) / len(results), name))
+                scored.append((stress_score(results), name))
             else:
                 study.log(f"{name} out")
         scored.sort()
         alive = {name: alive[name] for _, name in scored[:keep]}
-        study.log("Round leaders: " + ", ".join(f"{name} {mean:.0f}s" for mean, name in scored[:keep]))
+        study.log("Round leaders: " + ", ".join(f"{name} score {score:.0f}" for score, name in scored[:keep]))
         if not alive:
             break
-    current_mean = sum(r["sim_s"] for r in baseline) / len(baseline)
-    for name, params in alive.items():
-        results = study.state["runs"][name]["results"].values()
-        mean = sum(r["sim_s"] for r in results) / len(results)
+    study.log(f"Current settings on the development scenarios: {summary(baseline)}")
+    for name in alive:
         study.log(
-            f"Best: {name} {params}: {mean:.0f}s mean vs {current_mean:.0f}s now ({100 * (1 - mean / current_mean):.0f}% faster)"
+            f"Best: {name} {alive[name]}: {summary(list(study.state['runs'][name]['results'].values()))}"
         )
+    if args.holdout and alive:
+        held_out = list(range(args.holdout[0], args.holdout[1] + 1))
+        study.log(f"Held-out check on scenarios {held_out[0]}-{held_out[-1]}")
+        for name, params in [("current", DEFAULTS), *alive.items()]:
+            study.log(f"Held out, {name}: {summary(study.evaluate(name + '_holdout', params, held_out))}")
     study.log("Done")
 
 

@@ -27,6 +27,7 @@ LEROBOT_ROOT = Path(
     os.environ.get("LEROBOT_ROOT", next((p for p in HERE.parents if (p / "src/lerobot").is_dir()), HERE))
 )
 sys.path.insert(0, str(LEROBOT_ROOT))
+sys.path.insert(0, str(LEROBOT_ROOT / "src"))  # its lerobot, not whichever is installed
 from tests.mocks.mock_motors_bus import MockBus  # noqa: E402
 
 MODEL_REPO = "https://github.com/TheRobotStudio/SO-ARM100.git"
@@ -45,6 +46,7 @@ TICKS_PER_RAD = TICKS / (2 * math.pi)
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 IDS = {name: index + 1 for index, name in enumerate(JOINTS)}
 MAX_TORQUE_NM = 3.35  # stall torque of the actuators in the model
+STRESS_PCT = 20  # % of the servo's maximum torque above which a joint counts as pushing hard
 SERVO_KP = 10.0  # N.m/rad
 SERVO_KV = 0.3  # N.m.s/rad
 BASE_BACK_X = -0.031  # back edge of the base, in the model's frame
@@ -109,6 +111,9 @@ def build_model(wall_gap: float | None = 0.04, clamps: bool = True) -> mujoco.Mj
     model.actuator_gainprm[:, 0] = SERVO_KP
     model.actuator_biasprm[:, 1] = -SERVO_KP
     model.actuator_biasprm[:, 2] = -SERVO_KV
+    # A servo told to go past a stop pushes into it, up to its torque limit: its target is not
+    # clipped to the joint's range, as the official model's ctrlrange would have it.
+    model.actuator_ctrllimited[:] = 0
     return model
 
 
@@ -142,9 +147,24 @@ class SimArm:
 
     def __post_init__(self) -> None:
         self.data = mujoco.MjData(self.model)
+        # Stress on each joint: the largest torque its servo applied, and how long it applied more
+        # than STRESS_PCT of its maximum, the time spent pushing hard rather than holding the arm.
+        self._peak = np.zeros(len(JOINTS))
+        self._hard = np.zeros(len(JOINTS))
         self.joint_ids = {name: self.model.joint(name).id for name in JOINTS}
         self.actuator_ids = {name: self.model.actuator(name).id for name in JOINTS}
         self.qadr = {name: self.model.jnt_qposadr[self.joint_ids[name]] for name in JOINTS}
+        self._actuators = np.array([self.actuator_ids[name] for name in JOINTS])
+
+    @property
+    def peak_torque(self) -> dict[str, float]:
+        """The largest torque each joint's servo applied, in N.m."""
+        return dict(zip(JOINTS, self._peak.tolist(), strict=True))
+
+    @property
+    def hard_push_s(self) -> dict[str, float]:
+        """How long each joint's servo applied more than STRESS_PCT of its maximum torque."""
+        return dict(zip(JOINTS, self._hard.tolist(), strict=True))
 
     # -- encoder ---------------------------------------------------------------------------
 
@@ -154,6 +174,12 @@ class SimArm:
     def raw(self, joint: str) -> float:
         servo = self.servos[joint]
         return servo.mount + servo.direction * self.angle(joint) * TICKS_PER_RAD
+
+    def load(self, joint: str) -> int:
+        """Present_Load as an STS3215 reports it: the torque applied, in 0.1% of its maximum,
+        signed towards higher readings."""
+        torque = float(self.data.actuator_force[self.actuator_ids[joint]])
+        return int(round(self.servos[joint].direction * torque / MAX_TORQUE_NM * 1000))
 
     def _register(self, joint: str, name: str) -> int:
         assert self.bus is not None
@@ -196,6 +222,9 @@ class SimArm:
             self._drive()
             mujoco.mj_step(self.model, self.data)
             self.time_s += self.model.opt.timestep
+            torque = np.abs(self.data.actuator_force[self._actuators])
+            np.maximum(self._peak, torque, out=self._peak)
+            self._hard += (torque > STRESS_PCT / 100 * MAX_TORQUE_NM) * self.model.opt.timestep
             if not self.trace or self.time_s - self.trace[-1][0] >= self.trace_every_s:
                 self.trace.append(
                     (
@@ -272,6 +301,7 @@ class SimBus(MockBus):
         for joint, id_ in IDS.items():
             noise = int(self.rng.integers(-jitter, jitter + 1)) if jitter else 0
             self.seed(id_, "present_position", (int(round(self.arm.present(joint))) + noise) % TICKS)
+            self.seed(id_, "present_load", self.arm.load(joint))
 
     def read_register_with_error(self, motor_id, register, retries=0):
         self._refresh()

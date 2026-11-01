@@ -1120,6 +1120,10 @@ class SerialMotorsBus(MotorsBusBase):
         still_ticks: int = 3,
         period_s: float = 0.02,
         guard: int = 0,
+        load_stall: float | None = None,
+        impact_speed: float = 0.6,
+        impact_run: int = 5,
+        report: dict[str, int] | None = None,
         on_step: Callable[[int], None] | None = None,
     ) -> int:
         """Drive a torque-enabled `motor` slowly in `direction` (+1 or -1) until it stalls.
@@ -1138,6 +1142,17 @@ class SerialMotorsBus(MotorsBusBase):
         Should its reading still jump across the end of the encoder, its torque is turned off at
         once: a servo told to go back would turn the long way round.
 
+        With `load_stall`, a motor that reports its load (`Present_Load`, in 0.1% of its maximum
+        torque) is also stalled as soon as it is still while pushing at least that fraction of
+        its torque limit, once it has moved: the push ends as the joint meets its stop, without
+        the goal first running `stall_error` ahead of it. A joint still at the start of a push,
+        accelerating its link, does not count.
+
+        `report`, if given, receives `impact`: 1 if the joint ran at speed, at least
+        `impact_speed` of a step each period for `impact_run` periods, until it stopped within a
+        few periods, as a joint meeting something does; 0 if it slowed down to a stall, as a joint
+        too weak to lift its load does.
+
         Returns:
             `int`: The raw position where the joint stalled.
 
@@ -1152,6 +1167,12 @@ class SerialMotorsBus(MotorsBusBase):
         max_position = self.resolution(self.motors[motor].model) - 1
         goal = int(self.read("Present_Position", motor, normalize=False))
         recent: deque[int] = deque(maxlen=stall_cycles + 1)
+        loaded = load_stall is not None and self._has_register(motor, "Present_Load")
+        limit = int(self.read("Torque_Limit", motor, normalize=False)) if loaded else 0
+        speeds: deque[int] = deque(maxlen=impact_run + stall_cycles + 6)
+        travelled = 0
+        if report is not None:
+            report.pop("impact", None)
         # The goal advances at most once per period; a joint that keeps creeping without ever
         # catching up is bounded too.
         for _ in range(10 * (max_position // step + stall_cycles)):
@@ -1162,13 +1183,24 @@ class SerialMotorsBus(MotorsBusBase):
                     f"Motor '{motor}' fell past the end of its encoder, from {recent[-1]} to {position}; "
                     "its torque is off."
                 )
+            moved = direction * (position - recent[-1]) if recent else 0
+            travelled = max(travelled, travelled + moved)
+            speeds.append(moved)
             recent.append(position)
             if on_step is not None:
                 on_step(position)
+            load = abs(int(self.read("Present_Load", motor, normalize=False))) if loaded else 0
             lagging = direction * (goal - position) > stall_error
+            pressing = (
+                loaded and load_stall is not None and travelled >= 3 * step and load >= load_stall * limit
+            )
             still = len(recent) == recent.maxlen and max(recent) - min(recent) <= still_ticks
-            if lagging and still:
+            if (lagging or pressing) and still:
                 self.write("Goal_Position", motor, position, normalize=False)
+                if report is not None:
+                    report["impact"] = int(
+                        self._ran_into_something(list(speeds), step, impact_speed, impact_run)
+                    )
                 return position
             if not lagging:
                 goal += direction * step
@@ -1183,18 +1215,44 @@ class SerialMotorsBus(MotorsBusBase):
         self.write("Goal_Position", motor, position, normalize=False)
         raise RuntimeError(f"Motor '{motor}' neither stalled nor reached the end of its encoder.")
 
+    @staticmethod
+    def _ran_into_something(speeds: list[int], step: int, impact_speed: float, impact_run: int) -> bool:
+        """Whether a joint, by the ticks it moved each period up to its stall, ran at speed until it
+        stopped abruptly: `impact_run` periods of at least `impact_speed` of a step, then no more
+        than a few slower ones."""
+        fast = impact_speed * step
+        slowing = 0
+        while speeds and speeds[-1] < fast:
+            speeds.pop()
+            slowing += 1
+        running = 0
+        while speeds and speeds[-1] >= fast:
+            speeds.pop()
+            running += 1
+        return running >= impact_run and slowing <= impact_run
+
     def _seek_confirmed_stop(
         self,
         motor: str,
         direction: int,
         torque_limits: Sequence[int],
         confirm_tolerance: int,
-        seek: Callable[[str, int], int],
+        seek: Callable[[str, int, dict[str, int]], int],
+        trust_impacts: bool = False,
+        known: int | None = None,
     ) -> tuple[int, bool]:
         """Seek the stop of `motor` in `direction` at each torque of `torque_limits` in turn,
         each push starting where the last one stalled, until a stronger push gets no further
         than `confirm_tolerance` ticks: then the stall is the stop, not a lack of torque. The
         motor's own torque limit is back after each push.
+
+        A push needs no stronger one after it, and the stall is the stop, when either:
+        - with `trust_impacts`, the joint ran at speed until it stopped abruptly: it had torque
+          to spare, so something stopped it (see [`~SerialMotorsBus.find_hard_stop`]);
+        - the stall is within `confirm_tolerance` of `known`, a stop already confirmed in another
+          posture: the same stop, touched again. A stall short of it is pushed harder as any.
+        Only a joint that slows as its load nears the limit, as one lifting the arm, is pushed
+        harder, so most stops are only ever pressed at the first, weakest torque.
 
         Returns:
             `tuple[int, bool]`: The furthest position reached, and whether it was confirmed. A
@@ -1207,13 +1265,19 @@ class SerialMotorsBus(MotorsBusBase):
         for limit in limits:
             if limit is not None:
                 self.write("Torque_Limit", motor, limit, normalize=False)
+            report: dict[str, int] = {}
             try:
-                stop = seek(motor, direction)
+                stop = seek(motor, direction, report)
             finally:
                 if own_limit is not None:
                     self.write("Torque_Limit", motor, own_limit, normalize=False)
             if furthest is not None and direction * (stop - furthest) <= confirm_tolerance:
                 return (stop if direction * (stop - furthest) > 0 else furthest), True
+            if (trust_impacts and report.get("impact")) or (
+                known is not None and abs(stop - known) <= confirm_tolerance
+            ):
+                logger.info(f"{motor}: stop at {stop} with torque limit {limit}")
+                return stop if furthest is None or direction * (stop - furthest) > 0 else furthest, True
             furthest = stop if furthest is None or direction * (stop - furthest) > 0 else furthest
             logger.info(f"{motor}: stalled at {stop} with torque limit {limit}")
         assert furthest is not None
@@ -1318,6 +1382,9 @@ class SerialMotorsBus(MotorsBusBase):
         stall_error: int = 150,
         stall_cycles: int = 3,
         guard: int = 150,
+        load_stall: float | None = 0.9,
+        trust_impacts: bool = True,
+        working_torque_limit: int | None = None,
         period_s: float = 0.02,
     ) -> dict[str, MotorCalibration]:
         """Calibrate motors by driving each joint into its two hard stops, instead of by hand.
@@ -1393,6 +1460,16 @@ class SerialMotorsBus(MotorsBusBase):
                 where the joints started or into a posture; `None` moves as fast as `step`. The
                 pushes towards an unknown stop keep to `step`: faster, a joint meets what stops it
                 harder, and can wedge a link against it.
+            load_stall (`float`, *optional*, defaults to `0.9`):
+                Passed to [`~SerialMotorsBus.find_hard_stop`]: a joint still while pushing this
+                fraction of its torque limit has met its stop. `None` waits for `stall_error`.
+            working_torque_limit (`int`, *optional*):
+                Raw `Torque_Limit` of every motor for the whole calibration, restored after it:
+                what holding and moving the arm may use, while pushes towards a stop use
+                `torque_limits`. `None` leaves the motors' own limits.
+            trust_impacts (`bool`, *optional*, defaults to `True`):
+                A stop is confirmed by its first push when the joint ran into it at speed: no
+                stronger push follows. `False` confirms every stop with a stronger push.
             step, stall_error, stall_cycles, guard, period_s:
                 Passed to [`~SerialMotorsBus.find_hard_stop`]. `stall_error` is how far the goal may
                 lead a joint: a position servo pushes in proportion to it, so it must be large
@@ -1487,7 +1564,7 @@ class SerialMotorsBus(MotorsBusBase):
                 edge = guard + margin if direction == 1 else 2 * middles[motor] + 1 - guard - margin
                 rehome(motor, other[0], edge)
 
-        def seek(motor: str, direction: int) -> int:
+        def seek(motor: str, direction: int, report: dict[str, int]) -> int:
             # A joint that runs out of encoder is re-homed to make room and pushed on: its start
             # need not be within half a turn of its stops.
             follow_state["motion"] = direction
@@ -1501,6 +1578,8 @@ class SerialMotorsBus(MotorsBusBase):
                         stall_cycles=stall_cycles,
                         period_s=period_s,
                         guard=guard,
+                        load_stall=load_stall,
+                        report=report,
                         on_step=on_step(motor),
                     )
                     return reached - shifts[motor]
@@ -1527,6 +1606,10 @@ class SerialMotorsBus(MotorsBusBase):
                 motor, target, step=free_step, period_s=period_s, tolerance=return_tolerance, settle=settle
             )
 
+        limited = (
+            [m for m in motor_names if self._has_register(m, "Torque_Limit")] if working_torque_limit else []
+        )
+        own_limits = {m: int(self.read("Torque_Limit", m, normalize=False)) for m in limited}
         try:
             # Hold every joint where it is, so the arm does not sag while one is searched.
             starts = {
@@ -1534,6 +1617,10 @@ class SerialMotorsBus(MotorsBusBase):
             }
             for motor, position in starts.items():
                 self.write("Goal_Position", motor, position, normalize=False)
+            # The working limit caps every motor for the whole calibration, holding and moving the
+            # arm as much as pushing it: a move that meets something presses no harder than that.
+            for motor in limited:
+                self.write("Torque_Limit", motor, working_torque_limit, normalize=False)
             self.enable_torque(motor_names)
 
             # Survey: turn each joint a little each way to learn where gravity pulls it.
@@ -1601,8 +1688,15 @@ class SerialMotorsBus(MotorsBusBase):
                         }
                     )
                     for direction in (-1, 1):
+                        known = stops.get(direction)
                         stop, confirmed = self._seek_confirmed_stop(
-                            motor, direction, torque_limits, confirm_tolerance, seek
+                            motor,
+                            direction,
+                            torque_limits,
+                            confirm_tolerance,
+                            seek,
+                            trust_impacts=trust_impacts,
+                            known=known[0] if known is not None and known[1] else None,
                         )
                         best = stops.get(direction)
                         if best is None or direction * (stop - best[0]) > 0:
@@ -1639,6 +1733,8 @@ class SerialMotorsBus(MotorsBusBase):
                 )
         finally:
             self.disable_torque(motor_names)
+            for motor, own_limit in own_limits.items():
+                self.write("Torque_Limit", motor, own_limit, normalize=False)
 
         unconfirmed = [
             f"{motor} {'low' if direction < 0 else 'high'}"
