@@ -20,7 +20,7 @@ from functools import cached_property
 
 from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
-from lerobot.motors import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus
+from lerobot.motors import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus, Toward
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -47,9 +47,14 @@ _HARD_STOP_SEARCH_ORDER = [
 # behind the arm with the wrist straight: bent upward, the hand would curl into the wall. The shoulder pans with
 # the upper arm upright, the forearm raised and the wrist straight, the arm a column over the base, so the hand
 # sweeps into neither a wall behind it nor the table.
-_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] = {
+_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | Toward]]] = {
     "elbow_flex": [{"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
     "shoulder_lift": [
+        # Found in simulation as the clearest way to each stop: tipping forward, the forearm folds
+        # up and the wrist curls up, the arm compact over the table; tipping back, the forearm
+        # straightens nearly in line with the upper arm and the wrist bends a little down, clear of
+        # a wall 3.5 cm behind the base. Fractions from the end gravity pulls each joint towards.
+        {"elbow_flex": Toward(down=0.97, up=0.42), "wrist_flex": Toward(down=0.87, up=0.21)},
         {"wrist_flex": Raised(), "elbow_flex": Follow(1.0, lift=230, level=True)},
         {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
     ],
@@ -59,7 +64,7 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised]]] 
 # upright: tilted back, the folding hand meets a wall behind the arm. The shoulder's tilt is only known once it is
 # calibrated, so the elbow folds once more with the upper arm upright and the wrist bent each way, as which way is
 # inward depends on how its servo is mounted.
-_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised]]] = {
+_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised | Toward]]] = {
     "elbow_flex": [{"shoulder_lift": 0.5, "wrist_flex": 0.15}, {"shoulder_lift": 0.5, "wrist_flex": 0.85}],
 }
 
@@ -192,6 +197,7 @@ class SOFollower(Robot):
             full_turn_motors=["wrist_roll"],
             motors=_HARD_STOP_SEARCH_ORDER,
             torque_limits=self.config.auto_calibration_torque_limits,
+            expected_ranges=self.config.auto_calibration_expected_ranges,
             postures=_HARD_STOP_SEARCH_POSTURES,
             revisit=_HARD_STOP_REVISITS,
             lift={"elbow_flex": 230},

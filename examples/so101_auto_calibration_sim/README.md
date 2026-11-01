@@ -64,6 +64,8 @@ Every result below is from LeRobot's own calibration code driving the simulated 
 | Let go of a joint shoved by another's push before that one turns back | Shoved shoulder sprang back and wedged the hand into the wall at 100% torque | No wedge |
 | Cap moves at 45% torque, full torque only if blocked | Return moves pressed the hand into the wall at up to 33 N | ≤ 23 N, 5.5 N mean |
 | Raise only the forearm at the start; flip a raise blocked at once | Raising the shoulder "upright" leant the arm back into the wall | Correct |
+| Shoulder sweeps with elbow and wrist blending to targets found by `posture_search.py` | 2 postures for the shoulder | 1 in most runs |
+| Stop searching a joint once its range is as wide as designed (`expected_ranges`) | Every posture and revisit always run | 141 s → 123 s |
 
 From a start roughly in the middle pose (within 20° per joint, 30° for the pan), with a random servo assembly and a wall 3.5 cm to 20 cm behind the base or none:
 
@@ -78,9 +80,9 @@ That is 143 of 144. With the changes below the table, every scenario passes:
 | Scenarios | Pass | Peak torque, mean / max | Env. contact, mean / max | Steps | Arm time |
 |---|---|---|---|---|---|
 | 744–1343, before | 599 / 600 | 60% / 100% | 7.2 N / 21 N | 27 pushes + 69 moves | 174 s |
-| 90 hardest (all past failures, highest forces, 0–47) | 90 / 90 | 42% / 47% | 5.5 N / 19.5 N | 24 pushes + 71 moves | 140 s |
-| 1344–1943, fresh | **600 / 600** | 42% / 47% | 5.5 N / 22.8 N | 24 pushes + 72 moves | 141 s |
-| 744–1343, now | **600 / 600** | 42% / 46% | 5.5 N / 23.7 N | 24 pushes + 71 moves | 141 s |
+| 90 hardest (all past failures, highest forces, 0–47) | 90 / 90 | 40% / 47% | 6.1 N / 19.5 N | 23 pushes + 65 moves | 124 s |
+| 1344–1943, fresh | **600 / 600** | 40% / 47% | 5.7 N / 22.8 N | 22 pushes + 65 moves | 123 s |
+| 744–1343, now | **600 / 600** | 40% / 46% | 5.7 N / 23.7 N | 22 pushes + 65 moves | 123 s |
 
 The settings LeRobot ships were chosen by comparing variants on the 90 hardest scenarios with `optimize.py`: a torque ladder of 15% then 30%, two shoulder postures instead of four, moves capped at 45%. A single push at 30% (`--robot.auto_calibration_torque_limits=[300]`) saves another 6 pushes and 7 s at the same forces (599 of 600, before the fix of the one failure, a hand resting on the table), but presses every stop at 30% and has no stronger push to tell a stop from a joint too weak to move on.
 

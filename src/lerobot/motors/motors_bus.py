@@ -66,6 +66,23 @@ class Raised:
     upward, say. A posture with a motor whose survey found no pull is tried at both ends."""
 
 
+@dataclass(frozen=True)
+class Toward:
+    """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a calibrated motor
+    that turns, as the one searched sweeps from its start towards a stop, steadily from where it is
+    to a place in its range, which it reaches once the searched one has turned `reach` ticks, about
+    the way to its stop from the middle of its range. Places are fractions of the range from the
+    end gravity pulls the motor towards (0) to the end it pulls away from (1), as the survey found:
+    `down` while the searched joint turns the way gravity pulls it, `up` while it turns against
+    gravity. A forearm folded up as the shoulder tips forward, straightened as it tips back, keeps
+    the hand clear of the table in front and of a wall behind. Without a survey pull for either
+    motor, the follower stays where it is."""
+
+    down: float
+    up: float
+    reach: int = 1100
+
+
 class EncoderEndError(RuntimeError):
     """A joint driven towards a stop reached the end of its encoder first, at `position`."""
 
@@ -1410,22 +1427,22 @@ class SerialMotorsBus(MotorsBusBase):
 
     @staticmethod
     def _resolve_raised(
-        postures: Sequence[Mapping[str, float | Follow | Raised]],
+        postures: Sequence[Mapping[str, float | Follow | Raised | Toward]],
         gravity: Mapping[str, int],
         searched: str | None = None,
-    ) -> list[dict[str, float | Follow]]:
+    ) -> list[dict[str, float | Follow | Toward]]:
         """Place each [`Raised`] motor of `postures` at the end of its range gravity pulls away
         from, a posture tried at both ends for a motor whose survey found no pull, and give each
         `level` [`Follow`] of the `searched` motor its sign, both signs when a pull is unknown."""
-        resolved: list[dict[str, float | Follow]] = []
+        resolved: list[dict[str, float | Follow | Toward]] = []
         for posture in postures:
-            expanded: list[dict[str, float | Follow]] = [{}]
+            expanded: list[dict[str, float | Follow | Toward]] = [{}]
             for other, place in posture.items():
                 if isinstance(place, Follow) and place.level:
                     follower, leader = gravity.get(other, 0), gravity.get(searched or "", 0)
                     size = abs(place.ratio)
                     signs = (-follower * leader,) if follower and leader else (1, -1)
-                    ends: tuple[float | Follow, ...] = tuple(
+                    ends: tuple[float | Follow | Toward, ...] = tuple(
                         Follow(sign * size, place.lift) for sign in signs
                     )
                 elif not isinstance(place, Raised):
@@ -1446,10 +1463,12 @@ class SerialMotorsBus(MotorsBusBase):
         motors: Sequence[str] | None = None,
         *,
         torque_limits: Sequence[int] = (),
-        postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
-        revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised]]] | None = None,
+        postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward]]] | None = None,
+        revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward]]] | None = None,
         lift: Mapping[str, int] | None = None,
         raise_arm: Mapping[str, str] | None = None,
+        expected_ranges: Mapping[str, int] | None = None,
+        range_tolerance: float = 0.01,
         confirm_tolerance: int = 15,
         return_tolerance: int = 80,
         survey_ticks: int = 100,
@@ -1522,6 +1541,13 @@ class SerialMotorsBus(MotorsBusBase):
                 where it started: an elbow lifting a hand that started low, clear of the table the
                 first searches could press it into. A motor the survey found no pull on stays
                 where it is.
+            expected_ranges (`Mapping[str, int]`, *optional*):
+                Ticks between the two stops of a joint, as its design has them. A posture that finds
+                the range this wide, within `range_tolerance`, has found both its stops: it ends the
+                search of that joint: no other posture, nor its revisit, is tried. A range found
+                more than 5% off is reported.
+            range_tolerance (`float`, *optional*, defaults to `0.01`):
+                How much narrower than expected a range may be and still count as complete.
             raise_arm (`Mapping[str, str]`, *optional*):
                 Motors turned against gravity before anything else, in this order, each surveyed
                 just before: `"upright"` until its link stands over it, `"level"` until its link
@@ -1594,7 +1620,7 @@ class SerialMotorsBus(MotorsBusBase):
                 if outside := [
                     other
                     for other, place in posture.items()
-                    if not isinstance(place, (Follow, Raised)) and not 0 <= place <= 1
+                    if not isinstance(place, (Follow, Raised, Toward)) and not 0 <= place <= 1
                 ]:
                     raise ValueError(f"Postures of '{motor}' place {outside} outside their range.")
 
@@ -1627,6 +1653,9 @@ class SerialMotorsBus(MotorsBusBase):
         # The joints following the one searched in the current posture: their ratio, and where
         # each was when the searched one was at its start.
         followers: dict[str, tuple[float, int]] = {}
+        # The joints turning towards a place as the one searched sweeps: where each was at the
+        # start, and its goal while the searched one turns towards lower and higher readings.
+        towards: dict[str, tuple[int, int, int, int]] = {}
 
         # How far the searched joint has turned from its start, as its followers see it: a ratchet
         # that only moves in the direction the joint is driven (`motion`), so followers neither
@@ -1642,9 +1671,14 @@ class SerialMotorsBus(MotorsBusBase):
                 target = base + shifts[other] + round(ratio * follow_state["turned"])
                 target = max(range_mins[other], min(range_maxes[other], target))
                 self.write("Goal_Position", other, target, normalize=False)
+            for other, (base, to_lower, to_higher, reach) in towards.items():
+                start = base + shifts[other]
+                goal = to_higher if follow_state["turned"] > 0 else to_lower
+                progress = min(1.0, abs(follow_state["turned"]) / reach)
+                self.write("Goal_Position", other, round(start + progress * (goal - start)), normalize=False)
 
         def on_step(motor: str) -> Callable[[int], None] | None:
-            return (lambda reading: follow(motor, reading)) if followers else None
+            return (lambda reading: follow(motor, reading)) if followers or towards else None
 
         # The stops found so far of the joint searched: (position, confirmed) by direction.
         stops: dict[int, tuple[int, bool]] = {}
@@ -1745,7 +1779,7 @@ class SerialMotorsBus(MotorsBusBase):
             """Let go, where they are, of the joints pushed away from their goals; their goals."""
             released = {}
             for other in motor_names:
-                if other == pushed or other in followers:
+                if other == pushed or other in followers or other in towards:
                     continue
                 goal = int(self.read("Goal_Position", other, normalize=False))
                 present = int(self.read("Present_Position", other, normalize=False))
@@ -1815,7 +1849,23 @@ class SerialMotorsBus(MotorsBusBase):
             # Each joint in turn, then the ones revisited, in postures of joints calibrated since.
             schedule = [(motor, postures.get(motor) or [{}]) for motor in searched] + list(revisit.items())
             found: dict[str, dict[int, tuple[int, bool]]] = {}
+
+            def full_range(motor: str, ends: Mapping[int, tuple[int, bool]]) -> bool:
+                """Whether the stops found are as far apart as the range expected of the joint: both
+                are its stops, as a stall short of either would leave the range short, and no other
+                posture, nor a revisit, could find it wider."""
+                expected = (expected_ranges or {}).get(motor)
+                if expected is None or -1 not in ends or 1 not in ends:
+                    return False
+                span = ends[1][0] - ends[-1][0]
+                if span < (1 - range_tolerance) * expected:
+                    return False
+                logger.info(f"{motor}: range of {span} ticks, as wide as expected ({expected})")
+                return True
+
             for motor, motor_postures in schedule:
+                if motor in found and full_range(motor, found[motor]):
+                    continue
                 if motor in raised_from:
                     # Its own search starts where the arm was put: the raise only kept the hand
                     # off the table for the joints searched before.
@@ -1832,7 +1882,9 @@ class SerialMotorsBus(MotorsBusBase):
                     if not unknown:
                         continue
                     placed = {
-                        o: place for o, place in posture.items() if not isinstance(place, (Follow, Raised))
+                        o: place
+                        for o, place in posture.items()
+                        if not isinstance(place, (Follow, Raised, Toward))
                     }
                     for other, fraction in placed.items():
                         low, high = range_mins[other], range_maxes[other]
@@ -1847,7 +1899,7 @@ class SerialMotorsBus(MotorsBusBase):
                         move(other, starts[other])
                 for posture in self._resolve_raised(motor_postures, gravity, motor):
                     for other, place in posture.items():
-                        if not isinstance(place, (Follow, Raised)):
+                        if not isinstance(place, (Follow, Raised, Toward)):
                             low, high = range_mins[other], range_maxes[other]
                             move(other, round(low + place * (high - low)) - shifts[other])
                     follow_state["turned"] = 0
@@ -1864,6 +1916,25 @@ class SerialMotorsBus(MotorsBusBase):
                             if isinstance(place, Follow)
                         }
                     )
+                    for other, place in posture.items():
+                        if isinstance(place, Toward) and gravity.get(other) and gravity.get(motor):
+                            low, high = range_mins[other], range_maxes[other]
+
+                            def at(
+                                fraction: float, low: int = low, high: int = high, other: str = other
+                            ) -> int:
+                                # From the end gravity pulls the motor towards.
+                                if gravity[other] < 0:
+                                    return round(low + fraction * (high - low))
+                                return round(high - fraction * (high - low))
+
+                            with_gravity, against = at(place.down), at(place.up)
+                            towards[other] = (
+                                int(self.read("Present_Position", other, normalize=False)) - shifts[other],
+                                with_gravity if gravity[motor] < 0 else against,
+                                against if gravity[motor] < 0 else with_gravity,
+                                place.reach,
+                            )
                     for direction in (-1, 1):
                         known = stops.get(direction)
                         stop, confirmed = self._seek_confirmed_stop(
@@ -1889,9 +1960,12 @@ class SerialMotorsBus(MotorsBusBase):
                     # next posture, should it reach further, as a joint once too weak to lift.
                     rehome(motor, (stops[-1][0] + stops[1][0]) // 2, middles[motor])
                     followers.clear()
+                    towards.clear()
                     for other in posture:
                         move(other, starts[other])
                     logger.info(f"{motor}: stops at {stops[-1][0]} and {stops[1][0]} in posture {posture}")
+                    if full_range(motor, stops):
+                        break
 
                 found[motor] = dict(stops)
                 if motor in lifted_from:
@@ -1927,6 +2001,14 @@ class SerialMotorsBus(MotorsBusBase):
                 f"These stops were still moving at the strongest push, so the ranges may be short: {unconfirmed}."
                 " Raise the strongest torque limit, or check what holds these joints back."
             )
+        for motor, expected in (expected_ranges or {}).items():
+            if motor in range_mins:
+                span = range_maxes[motor] - range_mins[motor] + 2 * margin
+                if abs(span - expected) > 0.05 * expected:
+                    logger.warning(
+                        f"{motor}: range of {span} ticks, {'short of' if span < expected else 'beyond'} the "
+                        f"{expected} expected. Check what held it back, or correct the expected range."
+                    )
 
         for motor in full_turn_motors:
             range_mins[motor] = 0

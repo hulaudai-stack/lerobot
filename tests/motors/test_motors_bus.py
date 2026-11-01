@@ -19,7 +19,15 @@ from unittest.mock import call, patch
 
 import pytest
 
-from lerobot.motors.motors_bus import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus
+from lerobot.motors.motors_bus import (
+    Follow,
+    Motor,
+    MotorCalibration,
+    MotorNormMode,
+    Raised,
+    SerialMotorsBus,
+    Toward,
+)
 from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import _require_package_cache
 from tests.mocks.mock_motors_bus import DUMMY_1, DUMMY_2, DUMMY_3, MockBus, MockMotorsBus
@@ -1062,3 +1070,51 @@ def test_a_raise_blocked_at_once_turns_nothing_and_lets_go(arm, monkeypatch):
 
     assert arm._raise_joint("dummy_1", 1, "level", move) == 0
     assert arm.read("Goal_Position", "dummy_1", normalize=False) == 2060
+
+
+def test_a_joint_found_as_wide_as_expected_is_not_searched_in_more_postures(arm, monkeypatch):
+    """`dummy_1` reaches both its stops, 2000 ticks apart, in its first posture: with that range
+    expected, its second posture, with `dummy_3` turned, is never tried."""
+    joints = _Joints(arm, {1: (1000, 3000), 2: (0, 4095), 3: (1000, 3000)})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    searched_with: list[int] = []
+    seek = arm.find_hard_stop
+
+    def watch(motor, *args, **kwargs):
+        if motor == "dummy_1":
+            searched_with.append(joints.angles[3])
+        return seek(motor, *args, **kwargs)
+
+    monkeypatch.setattr(arm, "find_hard_stop", watch)
+    arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_1": [{}, {"dummy_3": 0.9}]},
+        expected_ranges={"dummy_1": 2000},
+    )
+
+    assert len(searched_with) == 2  # one push each way, in the first posture only
+
+
+def test_toward_turns_a_follower_to_its_place_as_the_joint_sweeps(arm, monkeypatch):
+    """Gravity pulls `dummy_1` and `dummy_3` towards higher readings. As `dummy_1` sweeps towards
+    lower readings, against its gravity, `dummy_3` turns steadily to the place `up` of its range,
+    measured from its higher end, gravity's: 0.25 of 1000..3000 is 2500."""
+    seen: list[tuple[int, int]] = []
+
+    def stops(joints: _Joints) -> tuple[int, int]:
+        seen.append((joints.angles[1], joints.angles[3]))
+        return 1000, 3000
+
+    joints = _Joints(arm, {1: stops, 2: (0, 4095), 3: (1000, 3000)}, sag={1: -30, 3: -30})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_1": [{"dummy_3": Toward(down=0.9, up=0.25, reach=1000)}]},
+    )
+
+    at_low_stop = [wrist for shoulder, wrist in seen if shoulder <= 1010]
+    assert at_low_stop and all(abs(wrist - 2500) <= 60 for wrist in at_low_stop)

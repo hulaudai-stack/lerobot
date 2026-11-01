@@ -59,6 +59,18 @@ class SOFollowerConfig:
     # weakest first: a stall counts as the stop once a stronger push gets no further, so a joint too weak to
     # lift the arm at a low torque is pushed again harder.
     auto_calibration_torque_limits: list[int] = field(default_factory=lambda: [150, 300])
+    # Ticks between the two stops of each joint, from the SO-101's design (its official model): a joint
+    # found this wide is not searched in further postures, and a range more than 5% off is reported.
+    # Correct them from a calibration of your own arm if they are reported off; `{}` turns this off.
+    auto_calibration_expected_ranges: dict[str, int] = field(
+        default_factory=lambda: {
+            "shoulder_pan": 2503,
+            "shoulder_lift": 2276,
+            "elbow_flex": 2203,
+            "wrist_flex": 2162,
+            "gripper": 1252,
+        }
+    )
 
 
 @RobotConfig.register_subclass("so101_follower")
