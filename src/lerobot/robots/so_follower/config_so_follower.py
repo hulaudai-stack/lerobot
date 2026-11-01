@@ -66,7 +66,7 @@ class SOFollowerConfig:
         default_factory=lambda: {
             "shoulder_pan": 2503,
             "shoulder_lift": 2276,
-            "elbow_flex": 2203,
+            "elbow_flex": 2130,  # folding, the forearm meets the shoulder bracket 6 degrees early
             "wrist_flex": 2162,
             "gripper": 1252,
         }

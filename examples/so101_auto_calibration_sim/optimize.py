@@ -52,6 +52,8 @@ POSTURE_SETS = {
     "plus_straight": {"shoulder_lift": "plus_straight"},
     "level_straight": {"shoulder_lift": "level_straight"},
     "level_mixed": {"shoulder_lift": "level_mixed"},
+    # Without the turns of the upper arm while the wrist and elbow are searched.
+    "no_turn": {"wrist_flex": "no_turn", "elbow_flex": "no_turn"},
 }
 
 DEFAULTS = {
@@ -111,6 +113,14 @@ def postures_for(name: str):
             {"wrist_flex": raised, "elbow_flex": Follow(1.0, lift=230, level=True)},
             {"wrist_flex": 0.5, "elbow_flex": Follow(1.0, level=True)},
         ]
+    for joint in ("wrist_flex", "elbow_flex"):
+        if lean.get(joint) == "no_turn":
+            from lerobot.motors import Turn
+
+            postures[joint] = [
+                {o: p for o, p in posture.items() if not isinstance(p, Turn)} for posture in postures[joint]
+            ]
+            postures[joint] = [p for p in postures[joint] if p] or [{}]
     if lean.get("elbow_flex") == "wrist_bent_only":
         postures["elbow_flex"] = [p for p in postures["elbow_flex"] if p]
     assert all(postures.values())  # every joint keeps at least one posture
@@ -174,6 +184,8 @@ def run_case(job: tuple[dict, dict], video: Path | None = None) -> dict:
         {j: Servo(m, d) for j, (m, d) in case["servos"].items()},
         record=video is not None,
         frame_every_s=0.25,
+        width=int(os.environ.get("VIDEO_WIDTH", "480")),
+        height=int(os.environ.get("VIDEO_HEIGHT", "360")),
     )
     arm.trace_every_s = 1e9
     arm.noise_ticks = int(os.environ.get("NOISE_TICKS", "0"))

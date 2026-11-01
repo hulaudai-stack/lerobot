@@ -83,6 +83,21 @@ class Toward:
     reach: int = 1100
 
 
+@dataclass(frozen=True)
+class Turn:
+    """In a posture of [`~SerialMotorsBus.record_calibration_from_hard_stops`], a motor that turns,
+    as the one searched sweeps from its start towards a stop, steadily by a number of ticks against
+    gravity, as the survey found it (negative: with gravity), which it has turned once the searched
+    one has turned `reach` ticks: `down` while the searched joint turns the way gravity pulls it,
+    `up` while it turns against gravity. Unlike [`Toward`], it needs no calibration of the motor,
+    only its pull, so it moves the joints searched later out of the way: the upper arm tipped back a
+    little while the wrist bends down, say. Without a survey pull for either motor, it stays put."""
+
+    down: int
+    up: int
+    reach: int = 1000
+
+
 class EncoderEndError(RuntimeError):
     """A joint driven towards a stop reached the end of its encoder first, at `position`."""
 
@@ -1427,22 +1442,22 @@ class SerialMotorsBus(MotorsBusBase):
 
     @staticmethod
     def _resolve_raised(
-        postures: Sequence[Mapping[str, float | Follow | Raised | Toward]],
+        postures: Sequence[Mapping[str, float | Follow | Raised | Toward | Turn]],
         gravity: Mapping[str, int],
         searched: str | None = None,
-    ) -> list[dict[str, float | Follow | Toward]]:
+    ) -> list[dict[str, float | Follow | Toward | Turn]]:
         """Place each [`Raised`] motor of `postures` at the end of its range gravity pulls away
         from, a posture tried at both ends for a motor whose survey found no pull, and give each
         `level` [`Follow`] of the `searched` motor its sign, both signs when a pull is unknown."""
-        resolved: list[dict[str, float | Follow | Toward]] = []
+        resolved: list[dict[str, float | Follow | Toward | Turn]] = []
         for posture in postures:
-            expanded: list[dict[str, float | Follow | Toward]] = [{}]
+            expanded: list[dict[str, float | Follow | Toward | Turn]] = [{}]
             for other, place in posture.items():
                 if isinstance(place, Follow) and place.level:
                     follower, leader = gravity.get(other, 0), gravity.get(searched or "", 0)
                     size = abs(place.ratio)
                     signs = (-follower * leader,) if follower and leader else (1, -1)
-                    ends: tuple[float | Follow | Toward, ...] = tuple(
+                    ends: tuple[float | Follow | Toward | Turn, ...] = tuple(
                         Follow(sign * size, place.lift) for sign in signs
                     )
                 elif not isinstance(place, Raised):
@@ -1463,8 +1478,8 @@ class SerialMotorsBus(MotorsBusBase):
         motors: Sequence[str] | None = None,
         *,
         torque_limits: Sequence[int] = (),
-        postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward]]] | None = None,
-        revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward]]] | None = None,
+        postures: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward | Turn]]] | None = None,
+        revisit: Mapping[str, Sequence[Mapping[str, float | Follow | Raised | Toward | Turn]]] | None = None,
         lift: Mapping[str, int] | None = None,
         raise_arm: Mapping[str, str] | None = None,
         expected_ranges: Mapping[str, int] | None = None,
@@ -1615,12 +1630,18 @@ class SerialMotorsBus(MotorsBusBase):
                 raise ValueError(f"Postures are given for '{motor}', which is not searched.")
             before = searched[: searched.index(motor)]
             for posture in motor_postures:
-                if misplaced := [other for other in posture if other not in before]:
+                # A turn moves a joint from where it is, so it may be one searched later.
+                if misplaced := [
+                    other
+                    for other, place in posture.items()
+                    if other not in before
+                    and not (isinstance(place, Turn) and other in searched and other != motor)
+                ]:
                     raise ValueError(f"Postures of '{motor}' place {misplaced}, not searched before it.")
                 if outside := [
                     other
                     for other, place in posture.items()
-                    if not isinstance(place, (Follow, Raised, Toward)) and not 0 <= place <= 1
+                    if not isinstance(place, (Follow, Raised, Toward, Turn)) and not 0 <= place <= 1
                 ]:
                     raise ValueError(f"Postures of '{motor}' place {outside} outside their range.")
 
@@ -1884,7 +1905,7 @@ class SerialMotorsBus(MotorsBusBase):
                     placed = {
                         o: place
                         for o, place in posture.items()
-                        if not isinstance(place, (Follow, Raised, Toward))
+                        if not isinstance(place, (Follow, Raised, Toward, Turn))
                     }
                     for other, fraction in placed.items():
                         low, high = range_mins[other], range_maxes[other]
@@ -1899,7 +1920,7 @@ class SerialMotorsBus(MotorsBusBase):
                         move(other, starts[other])
                 for posture in self._resolve_raised(motor_postures, gravity, motor):
                     for other, place in posture.items():
-                        if not isinstance(place, (Follow, Raised, Toward)):
+                        if not isinstance(place, (Follow, Raised, Toward, Turn)):
                             low, high = range_mins[other], range_maxes[other]
                             move(other, round(low + place * (high - low)) - shifts[other])
                     follow_state["turned"] = 0
@@ -1931,6 +1952,16 @@ class SerialMotorsBus(MotorsBusBase):
                             with_gravity, against = at(place.down), at(place.up)
                             towards[other] = (
                                 int(self.read("Present_Position", other, normalize=False)) - shifts[other],
+                                with_gravity if gravity[motor] < 0 else against,
+                                against if gravity[motor] < 0 else with_gravity,
+                                place.reach,
+                            )
+                        if isinstance(place, Turn) and gravity.get(other) and gravity.get(motor):
+                            here = int(self.read("Present_Position", other, normalize=False))
+                            with_gravity = here - gravity[other] * place.down
+                            against = here - gravity[other] * place.up
+                            towards[other] = (
+                                here - shifts[other],
                                 with_gravity if gravity[motor] < 0 else against,
                                 against if gravity[motor] < 0 else with_gravity,
                                 place.reach,

@@ -20,7 +20,16 @@ from functools import cached_property
 
 from lerobot.cameras import DepthCamera, make_cameras_from_configs
 from lerobot.lerobot_types import RobotAction, RobotObservation
-from lerobot.motors import Follow, Motor, MotorCalibration, MotorNormMode, Raised, SerialMotorsBus, Toward
+from lerobot.motors import (
+    Follow,
+    Motor,
+    MotorCalibration,
+    MotorNormMode,
+    Raised,
+    SerialMotorsBus,
+    Toward,
+    Turn,
+)
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
@@ -47,8 +56,16 @@ _HARD_STOP_SEARCH_ORDER = [
 # behind the arm with the wrist straight: bent upward, the hand would curl into the wall. The shoulder pans with
 # the upper arm upright, the forearm raised and the wrist straight, the arm a column over the base, so the hand
 # sweeps into neither a wall behind it nor the table.
-_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | Toward]]] = {
-    "elbow_flex": [{"wrist_flex": 0.15}, {"wrist_flex": 0.85}],
+_HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | Toward | Turn]]] = {
+    # Found in simulation: folding down, the forearm brings the hand onto the table unless the upper
+    # arm tips back 60 degrees and the wrist turns up 40; turning up, it meets a wall close behind
+    # unless the upper arm tips forward 15 degrees (114 ticks are 10 degrees). Then, should the fold
+    # fall short, the wrist bent each way.
+    "elbow_flex": [
+        {"shoulder_lift": Turn(down=684, up=-171, reach=500), "wrist_flex": Turn(down=455, up=0, reach=500)},
+        {"wrist_flex": 0.15},
+        {"wrist_flex": 0.85},
+    ],
     "shoulder_lift": [
         # Found in simulation (`posture_search.py`) as the ways to each stop that leave the links the
         # most room, from any middle-pose start, a wall 3.5 cm behind the base: tipping forward, the
@@ -65,7 +82,7 @@ _HARD_STOP_SEARCH_POSTURES: dict[str, list[dict[str, float | Follow | Raised | T
 # upright: tilted back, the folding hand meets a wall behind the arm. The shoulder's tilt is only known once it is
 # calibrated, so the elbow folds once more with the upper arm upright and the wrist bent each way, as which way is
 # inward depends on how its servo is mounted.
-_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised | Toward]]] = {
+_HARD_STOP_REVISITS: dict[str, list[dict[str, float | Follow | Raised | Toward | Turn]]] = {
     "elbow_flex": [{"shoulder_lift": 0.5, "wrist_flex": 0.15}, {"shoulder_lift": 0.5, "wrist_flex": 0.85}],
 }
 

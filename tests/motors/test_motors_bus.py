@@ -27,6 +27,7 @@ from lerobot.motors.motors_bus import (
     Raised,
     SerialMotorsBus,
     Toward,
+    Turn,
 )
 from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import _require_package_cache
@@ -1118,3 +1119,26 @@ def test_toward_turns_a_follower_to_its_place_as_the_joint_sweeps(arm, monkeypat
 
     at_low_stop = [wrist for shoulder, wrist in seen if shoulder <= 1010]
     assert at_low_stop and all(abs(wrist - 2500) <= 60 for wrist in at_low_stop)
+
+
+def test_turn_moves_a_joint_searched_later_against_gravity_as_the_joint_sweeps(arm, monkeypatch):
+    """Gravity pulls `dummy_1` and `dummy_3` towards higher readings. As `dummy_3`, searched first,
+    sweeps towards higher readings, with its gravity, `dummy_1`, not yet calibrated, turns 300
+    ticks against its own gravity, towards lower readings, from where it was."""
+    seen: list[tuple[int, int]] = []
+
+    def stops(joints: _Joints) -> tuple[int, int]:
+        seen.append((joints.angles[3], joints.angles[1]))
+        return 1000, 3000
+
+    joints = _Joints(arm, {1: (500, 3500), 2: (0, 4095), 3: stops}, sag={1: -30, 3: -30})
+    monkeypatch.setattr("lerobot.motors.motors_bus.time.sleep", joints.tick)
+    arm.record_calibration_from_hard_stops(
+        "position",
+        full_turn_motors=["dummy_2"],
+        motors=["dummy_3", "dummy_1", "dummy_2"],
+        postures={"dummy_3": [{"dummy_1": Turn(down=300, up=0, reach=500)}]},
+    )
+
+    at_high_stop = [shoulder for wrist, shoulder in seen if wrist >= 2990]
+    assert at_high_stop and all(abs(shoulder - (2047 + 30 - 300)) <= 60 for shoulder in at_high_stop)
