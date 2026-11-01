@@ -16,7 +16,8 @@ TOLERANCE_DEG = 3.0
 
 def one(args):
     seed, gap, out = args
-    os.environ.setdefault("MUJOCO_GL", "osmesa")
+    if sys.platform.startswith("linux"):  # macOS refuses osmesa
+        os.environ.setdefault("MUJOCO_GL", "osmesa")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from run_calibration import run
 

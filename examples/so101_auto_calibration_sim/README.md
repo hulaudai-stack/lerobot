@@ -33,7 +33,7 @@ python batch.py out/batch 1 8 0.04 0.10
 python reachability.py
 ```
 
-On Linux without a display, set `MUJOCO_GL=egl` (GPU) or `MUJOCO_GL=osmesa` (software).
+On Linux without a display, the scripts use software rendering (`MUJOCO_GL=osmesa`); set `MUJOCO_GL=egl` for a GPU. On macOS nothing needs setting.
 
 ## Watch it live
 

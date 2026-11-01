@@ -30,7 +30,8 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
+if sys.platform.startswith("linux"):  # software rendering for headless Linux; macOS refuses it
+    os.environ.setdefault("MUJOCO_GL", "osmesa")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import so101sim  # noqa: E402,F401  (puts the LeRobot checkout under test first on the path)
 
