@@ -80,11 +80,12 @@ That is 143 of 144. With the changes below the table, every scenario passes:
 | 744–1343, before | 599 / 600 | 60% / 100% | 7.2 N / 21 N | 27 pushes + 69 moves | 174 s |
 | 90 hardest (all past failures, highest forces, 0–47) | 90 / 90 | 42% / 47% | 5.5 N / 19.5 N | 24 pushes + 71 moves | 140 s |
 | 1344–1943, fresh | **600 / 600** | 42% / 47% | 5.5 N / 22.8 N | 24 pushes + 72 moves | 141 s |
+| 744–1343, now | **600 / 600** | 42% / 46% | 5.5 N / 23.7 N | 24 pushes + 71 moves | 141 s |
 
 The settings LeRobot ships were chosen by comparing variants on the 90 hardest scenarios with `optimize.py`: a torque ladder of 15% then 30%, two shoulder postures instead of four, moves capped at 45%. A single push at 30% (`--robot.auto_calibration_torque_limits=[300]`) saves another 6 pushes and 7 s at the same forces (599 of 600, before the fix of the one failure, a hand resting on the table), but presses every stop at 30% and has no stronger push to tell a stop from a joint too weak to move on.
 
 ### Limits
 
-- **Start far from the middle pose.** Started anywhere within ~45% of each joint's range, 30 of 48 runs pass. Most failures are a hand that starts close to the table getting wedged against it. Recovering would mean dropping torque on a loaded joint, which on a real arm drops the shoulder, so the calibration asks to start in the middle pose.
+- **Start far from the middle pose.** Started anywhere within ~45% of each joint's range, 35 of 48 runs pass (30 before). Most failures are a hand that starts close to the table getting wedged against it. Recovering would mean dropping torque on a loaded joint, which on a real arm drops the shoulder, so the calibration asks to start in the middle pose.
 - **Contact.** Every run touches the table or the wall: a stop the arm cannot reach without touching either is reached by pressing on it, at a reduced torque. About one run in six presses on it with more than 10 N, briefly.
 - **Speed.** Ramping faster than 8 ticks per 20 ms fails even for moves back through space already swept: a hand starting near the table swings into it and wedges. The same holds for a first push above 15% torque. The optimiser therefore only tunes stall detection, survey size, the torque ladder and the postures.
